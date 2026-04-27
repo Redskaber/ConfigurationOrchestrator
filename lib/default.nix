@@ -99,7 +99,9 @@ let
         included && !excluded;
 
       filtered    = lib.filterAttrs keep files;
-      transformed = lib.mapAttrs p.transform filtered;
+      # Pass relPath explicitly — lib.mapAttrs supplies (name: value),
+      # which matches our transform signature (relPath: entry: …).
+      transformed = lib.mapAttrs (relPath: entry: p.transform relPath entry) filtered;
       cleaned     = lib.filterAttrs (_: v: v != null) transformed;
     in
     lib.mapAttrs (_: entry: entry // {
@@ -122,8 +124,10 @@ let
 
   # ── 3a: home.file attrset ────────────────────────────────────────────────
   # destPrefix is prepended to every key.
-  # If the entry has a `text` field (injected by a transform) it wins over
-  # `source`; otherwise `source = entry.absPath`.
+  # Entry semantics (set by the policy / transform):
+  #   entry.text   → { text = …; }          inline text, no source
+  #   entry.force  → adds force = true       opt-in physical-copy flag
+  #   otherwise    → { source = absPath; }  plain symlink (default)
   toHomeFiles = destPrefix: files:
     lib.mapAttrs'
       (relPath: entry:
@@ -132,9 +136,9 @@ let
                   else "${destPrefix}/${relPath}";
           value =
             (if entry ? text
-             then { text   = entry.text; }
+             then { text = entry.text; }
              else { source = entry.absPath; })
-            // lib.optionalAttrs (entry ? priority) { force = true; };
+            // lib.optionalAttrs (entry.force or false) { force = true; };
         in
         lib.nameValuePair key value)
       files;
@@ -147,13 +151,15 @@ let
           (relPath: entry:
             let
               escapedRel = lib.escapeShellArg relPath;
-              content    =
+              # Materialise inline text as a store file so `cp` is always used.
+              # This is safe for any content (no shell-quoting of arbitrary text).
+              srcPath =
                 if entry ? text
-                then ''printf '%s' ${lib.escapeShellArg entry.text} > "$out/${relPath}"''
-                else ''cp ${entry.absPath} "$out/${relPath}"'';
+                then builtins.toFile (baseNameOf relPath) entry.text
+                else entry.absPath;
             in ''
               mkdir -p "$out/$(dirname ${escapedRel})"
-              ${content}
+              cp ${srcPath} "$out/"${escapedRel}
             '')
           files;
       in
@@ -177,7 +183,7 @@ let
                 else entry.absPath;
             in ''
               mkdir -p "$out/$(dirname ${escapedRel})"
-              ln -s ${target} "$out/${relPath}"
+              ln -s ${target} "$out/"${escapedRel}
             '')
           files;
       in
@@ -191,20 +197,15 @@ let
   # Multi-emitter dispatch
   # ───────────────────────────────────────────────────────────────────────────
   #
-  # `emit` takes the merged file map (where each entry carries an `emitter`
-  # field set by its policy) and dispatches to the correct emitter per file.
+  # `emit` splits the processed file map by each entry's `emitter` tag and
+  # routes each subset to the correct emitter function.
   #
-  # For "homeFiles":
-  #   Returns an attrset merged from all per-file home.file entries.
-  #
-  # For "derivation" / "symlinkTree":
-  #   Builds one derivation *per unique (emitter, name) pair* and returns
-  #   an attrset:
-  #     {
-  #       homeFiles   = { … home.file entries … };
-  #       derivations = { "name" = <drv>; … };
-  #       symlinks    = { "name" = <drv>; … };
-  #     }
+  # Returns:
+  #   {
+  #     homeFiles   :: attrset       always present (may be {})
+  #     derivation  :: derivation    present only when emitter="derivation" was used
+  #     symlinkTree :: derivation    present only when emitter="symlinkTree" was used
+  #   }
   #
   # `destPrefix` applies only to homeFiles entries.
   # `pkgs` is required when any policy uses "derivation" or "symlinkTree".
@@ -260,7 +261,7 @@ let
           p = {
             include    = [ ];
             exclude    = [ ];
-            transform  = _: entry: entry;
+            transform  = _relPath: entry: entry;
             emitter    = "symlink";    # "symlink" | "copy" | "text"
             destPrefix = "";
             priority   = 5;
@@ -273,7 +274,8 @@ let
             in included && !excluded;
 
           filtered    = lib.filterAttrs keep files;
-          transformed = lib.mapAttrs p.transform filtered;
+          transformed = lib.mapAttrs
+            (relPath: entry: p.transform relPath entry) filtered;
           cleaned     = lib.filterAttrs (_: v: v != null) transformed;
 
           toEntry = relPath: entry:
@@ -284,9 +286,10 @@ let
                 if p.emitter == "text" then
                   { text = entry.text; }
                 else if p.emitter == "copy" then
+                  # force = true signals toHomeFiles to add force attribute
                   { source = entry.absPath; force = true; }
                 else
-                  # "symlink" — plain home.file source link
+                  # "symlink" — plain symlink, no force
                   { source = entry.absPath; };
             in
             lib.nameValuePair key value;
@@ -294,7 +297,6 @@ let
         lib.mapAttrs' toEntry cleaned;
 
     in
-    # Fold all policy results; later policies override earlier ones
     lib.foldl' (acc: policy: acc // applyOneHomePolicy policy) { } policies;
 
   # ───────────────────────────────────────────────────────────────────────────

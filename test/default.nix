@@ -111,7 +111,7 @@ let
 
   sysFiles = orc.applyPolicy { include = [ "sys/" ]; } allFiles;
 
-  # source-based entry (no text field → { source = ...; force = true; })
+  # source-based entry: { source = absPath; }  — no force for plain symlinks
   t_toHomeFiles_source =
     let r = orc.toHomeFiles ".config/hypr" sysFiles; in {
       isAttrset      = builtins.isAttrs r;
@@ -119,8 +119,8 @@ let
       keysHavePrefix = lib.all
         (lib.hasPrefix ".config/hypr/sys/") (builtins.attrNames r);
       hasSource      = (lib.head (builtins.attrValues r)) ? source;
-      # priority field exists on entries → force = true
-      hasForce       = (lib.head (builtins.attrValues r)).force or false;
+      # plain homeFiles entries have no force (force is opt-in via entry.force)
+      noForce        = ! ((lib.head (builtins.attrValues r)).force or false);
     };
 
   # text-based entry (transform injects text field)

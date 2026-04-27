@@ -134,6 +134,17 @@ toDerivation  { pkgs, name, files }      # → store path (physical copy)
 toSymlinkTree { pkgs, name, files }      # → store path (symlink tree)
 ```
 
+`toHomeFiles` entry semantics:
+
+| Entry field          | home.file value                       |
+| -------------------- | ------------------------------------- |
+| `entry.text` present | `{ text = …; }`                       |
+| `entry.force = true` | adds `force = true` to the entry      |
+| otherwise            | `{ source = absPath; }` plain symlink |
+
+`force` is **opt-in** — only set it explicitly via a transform or the `"copy"`
+emitter in `mergeHomeFiles`. Plain `"homeFiles"` policy entries are symlinks.
+
 ### `emit` — multi-emitter dispatch
 
 Takes a file map from `applyPolicies` and routes each file to the emitter
@@ -417,6 +428,7 @@ readConfigDir {
   src        :: path
   recursive  :: bool          (default: true)
   policies   :: [ policy ]    (default: [])
+                               When [] all files pass through tagged "homeFiles".
   destPrefix :: string        (default: "")
   pkgs       :: pkgs          (required when any policy uses derivation/symlinkTree)
   name       :: string        (default: "config-tree")
@@ -427,6 +439,10 @@ readConfigDir {
     symlinkTree  :: derivation    present if any policy used "symlinkTree"
   }
 ```
+
+Note: `homeFiles` entries are plain symlinks (`{ source = … }`).
+To produce a forced copy inside `homeFiles` set `entry.force = true` via a
+transform, or use `mergeHomeFiles` with `emitter = "copy"`.
 
 ### `mergeHomeFiles`
 
