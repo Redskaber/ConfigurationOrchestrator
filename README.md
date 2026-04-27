@@ -190,28 +190,41 @@ emit {
 # → { homeFiles; ?derivation; ?symlinkTree; }
 ```
 
-### `mergeHomeFiles` — per-file control in one home.file attrset
+### `mergeHomeFiles` — per-file control, returns `{ homeFiles; activation; }`
 
 ```nix
 mergeHomeFiles files policies
+→ { homeFiles :: attrset;   # → home.file = result.homeFiles
+    activation :: string;   # → home.activation.<n>.script = result.activation
+  }
 ```
 
 Per-policy emitters:
 
-| `emitter`   | home.file value                         | result                                     |
-| ----------- | --------------------------------------- | ------------------------------------------ |
-| `"symlink"` | `{ source = absPath; }`                 | read-only symlink into Nix store           |
-| `"copy"`    | `{ text = builtins.readFile absPath; }` | **real writable file**                     |
-| `"text"`    | `{ text = entry.text; }`                | real writable file, content from transform |
+| `emitter`   | destination  | result                                             |
+| ----------- | ------------ | -------------------------------------------------- |
+| `"symlink"` | `homeFiles`  | read-only symlink into Nix store                   |
+| `"copy"`    | `activation` | **real writable file** — `cp` runs on every switch |
+| `"text"`    | `homeFiles`  | symlink to a store-generated text file             |
 
-**Why `"copy"` uses `text` and not `source + force`:**
-`force = true` in home-manager only controls whether a pre-existing path gets
-replaced before linking — the result is still a read-only symlink into the Nix
-store. The only way to produce a real writable file is via the `text` field,
-which home-manager materialises as a physical file on disk. `"copy"` reads the
-source file content at eval time (`builtins.readFile`) and passes it as `text`.
+**Why `"copy"` uses `home.activation` and not `home.file`:**
+home-manager's `home.file` **always** installs files as symlinks — regardless of
+`force`, `text`, or `source`. Symlinks point into the read-only Nix store.
+The only way to get a real writable file is to `cp` during activation, after
+home-manager has finished its linking phase.
 
-`"text"` without a transform that sets `entry.text` throws a descriptive error.
+```nix
+let result = orc.mergeHomeFiles files [
+  { include = []; exclude = [ "hyprland.conf" "*.png" ];
+    emitter = "symlink"; destPrefix = ".config/hypr"; }
+  { include = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+    emitter = "copy"; destPrefix = ".config/hypr"; }
+]; in
+{
+  home.file = result.homeFiles;
+  home.activation.hyprCopy = lib.hm.dag.entryAfter [ "writeBoundary" ] result.activation;
+}
+```
 
 ---
 
@@ -234,30 +247,35 @@ orc = inputs.configuration-orchestrator.lib.${pkgs.system};
 
 #### 1 — base-layer + point-override (recommended idiom)
 
-All files as symlinks, one file as physical copy for tools that write at runtime:
+All files as symlinks, one file as a real writable copy for tools that write at runtime:
 
 ```nix
-# hypr-config root has symlink aliases (hypridle.conf → sys/hypridle.conf).
-# Use listFilesRecursiveFiltered to skip them at discovery time.
-let files = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
-in
-{
-  home.file = orc.mergeHomeFiles files [
-    # Base layer: all files as symlinks
-    # exclude: hyprland.conf (managed by wayland.windowManager.hyprland)
-    #          *.png (binary assets)
+{ inputs, pkgs, lib, ... }:
+let
+  orc    = inputs.configuration-orchestrator.lib.${pkgs.system};
+  files  = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
+  result = orc.mergeHomeFiles files [
+    # Base layer: everything as symlinks
+    # - hyprland.conf excluded: managed by wayland.windowManager.hyprland
+    # - *.png excluded: binary assets
     { include    = [ ];
       exclude    = [ "hyprland.conf" "*.png" ];
       emitter    = "symlink";
       destPrefix = ".config/hypr"; }
 
-    # Override: wallust writes this file at runtime.
-    # A symlink into the Nix store is read-only → wallust would fail.
-    # force=true makes home-manager lay down a real writable file.
+    # wallust writes this file at runtime to inject dynamic colors.
+    # "copy" runs `cp` in the activation script → real writable file on disk.
     { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
       emitter    = "copy";
       destPrefix = ".config/hypr"; }
   ];
+in
+{
+  home.file = result.homeFiles;
+  # Activation runs after home-manager's linking phase.
+  # wallust-hyprland.conf will be a real file, not a symlink.
+  home.activation.hyprCopy =
+    lib.hm.dag.entryAfter [ "writeBoundary" ] result.activation;
 }
 ```
 
@@ -297,29 +315,31 @@ let result = orc.readConfigDir {
 }
 ```
 
-#### 4 — mergeHomeFiles: symlink + copy + text in one attrset
+#### 4 — mergeHomeFiles: symlink + copy + text
 
 ```nix
-home.file = orc.mergeHomeFiles
-  (orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ])
-  [
-    # Base: everything as symlinks (exclude binaries and managed files)
+{ inputs, pkgs, lib, ... }:
+let
+  orc    = inputs.configuration-orchestrator.lib.${pkgs.system};
+  files  = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
+  result = orc.mergeHomeFiles files [
+    # Base: symlinks for everything (exclude managed/binary files)
     { include    = [ ];
       exclude    = [ "*.png" "hyprland.conf" ];
       emitter    = "symlink";
       destPrefix = ".config/hypr"; }
 
-    # hardware/ as forced copies (allows local machine-specific overrides)
+    # hardware/ as real copies (allows per-machine local edits)
     { include    = [ "sys/hardware/" ];
       emitter    = "copy";
       destPrefix = ".config/hypr"; }
 
-    # wallust-managed file: must be a real writable file
+    # wallust: must be a real writable file (written at runtime)
     { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
       emitter    = "copy";
       destPrefix = ".config/hypr"; }
 
-    # inject Nix-management header into user startup config
+    # inject a header via inline text (still a symlink, but to a generated file)
     { include    = [ "user/startup.conf" ];
       emitter    = "text";
       transform  = _: e: e // {
@@ -327,6 +347,12 @@ home.file = orc.mergeHomeFiles
       };
       destPrefix = ".config/hypr"; }
   ];
+in
+{
+  home.file = result.homeFiles;
+  home.activation.hyprCopy =
+    lib.hm.dag.entryAfter [ "writeBoundary" ] result.activation;
+}
 ```
 
 #### 5 — drop source-tree symlinks via transform (alternative to filtered discovery)
@@ -467,7 +493,10 @@ readConfigDir {
 mergeHomeFiles
   files    :: { "rel/path" = { absPath; type; }; }
   policies :: [ homePolicy ]
-→ home.file attrset
+→ {
+    homeFiles  :: attrset   → home.file = result.homeFiles
+    activation :: string    → home.activation.<n>.script = result.activation
+  }
 
 homePolicy fields (all optional):
   include    :: [ pattern ]
@@ -476,6 +505,11 @@ homePolicy fields (all optional):
   emitter    :: "symlink" | "copy" | "text"   (default: "symlink")
   destPrefix :: string                         (default: "")
   priority   :: int                            (default: 5)
+
+emitter destinations:
+  "symlink"  → homeFiles   { source = absPath; }
+  "copy"     → activation  cp --remove-destination absPath $HOME/destPrefix/relPath
+  "text"     → homeFiles   { text = entry.text; }   (requires transform)
 ```
 
 ### `emit`
@@ -499,5 +533,5 @@ toHomeFiles                  :: destPrefix → files → attrset
 toDerivation                 :: { pkgs; name; files } → derivation
 toSymlinkTree                :: { pkgs; name; files } → derivation
 emit                         :: { files; destPrefix; pkgs; drvName } → result
-mergeHomeFiles               :: files → [ homePolicy ] → attrset
+mergeHomeFiles               :: files → [ homePolicy ] → { homeFiles; activation }
 ```

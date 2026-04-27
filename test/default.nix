@@ -170,88 +170,102 @@ let
 
   # ─────────────────────────────────────────────────────────────────────────
   # Layer 3c · mergeHomeFiles
+  # mergeHomeFiles now returns { homeFiles; activation; }
+  # homeFiles  → home.file attrset (symlink and text entries)
+  # activation → shell script string (copy entries, run in home.activation)
   # ─────────────────────────────────────────────────────────────────────────
 
   # Scenario A: explicit per-directory policies
   t_mergeHomeFiles_explicit =
     let
-      r = orc.mergeHomeFiles allFiles [
+      result = orc.mergeHomeFiles allFiles [
         { include    = [ "sys/" ];
           emitter    = "symlink";
           destPrefix = ".config/hypr"; }
         { include    = [ "sys/hardware/" ];
-          emitter    = "copy";
+          emitter    = "copy";           # → activation script cp, not homeFiles
           destPrefix = ".config/hypr"; }
         { include    = [ "hyprland.conf" ];
           emitter    = "text";
           transform  = _: entry: entry // { text = "# generated"; };
           destPrefix = ".config/hypr"; }
       ];
+      r       = result.homeFiles;
+      act     = result.activation;
       sysKey  = ".config/hypr/sys/default.conf";
-      hwKey   = ".config/hypr/sys/hardware/default.conf";
       hyprKey = ".config/hypr/hyprland.conf";
+      hwKey   = ".config/hypr/sys/hardware/default.conf";
     in {
-      isAttrset    = builtins.isAttrs r;
-      nonEmpty     = r != { };
-      sysPresent   = r ? "${sysKey}";
-      sysHasSource = (r."${sysKey}"  or { }) ? source;
-      sysNoForce   = ! ((r."${sysKey}"  or { }).force or false);
-      hwHasForce   = (r."${hwKey}"   or { }).force or false;
-      hwHasSource  = (r."${hwKey}"   or { }) ? source;
-      hyprHasText  = (r."${hyprKey}" or { }) ? text;
-      hyprNoSource = ! ((r."${hyprKey}" or { }) ? source);
+      hasHomeFiles  = builtins.isAttrs r;
+      nonEmpty      = r != { };
+      hasActivation = builtins.isString act;
+      # "symlink" entries go into homeFiles
+      sysPresent    = r ? "${sysKey}";
+      sysHasSource  = (r."${sysKey}"  or { }) ? source;
+      sysNoText     = ! ((r."${sysKey}" or { }) ? text);
+      # "copy" entries go into activation script, NOT homeFiles
+      hwNotInHome   = ! (r ? "${hwKey}");
+      activationHasHw = lib.hasInfix "sys/hardware" act;
+      # "text" entries go into homeFiles
+      hyprHasText   = (r."${hyprKey}" or { }) ? text;
+      hyprNoSource  = ! ((r."${hyprKey}" or { }) ? source);
     };
 
   # Scenario B: base-layer + point-override (the recommended idiom)
   t_mergeHomeFiles_baseLayer =
     let
-      wallustKey = ".config/hypr/sys/policy/wallust/wallust-hyprland.conf";
+      wallustRel = "sys/policy/wallust/wallust-hyprland.conf";
+      wallustKey = ".config/hypr/${wallustRel}";
       sysKey     = ".config/hypr/sys/default.conf";
 
-      r = orc.mergeHomeFiles allFiles [
+      result = orc.mergeHomeFiles allFiles [
         { include    = [ ];
           exclude    = [ "*.png" ];
           emitter    = "symlink";
           destPrefix = ".config/hypr"; }
-        { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
-          emitter    = "copy";     # reads content → real writable file
+        # wallust writes at runtime → cp in activation, real writable file
+        { include    = [ wallustRel ];
+          emitter    = "copy";
           destPrefix = ".config/hypr"; }
       ];
 
-      r2 = orc.mergeHomeFiles allFiles [
+      result2 = orc.mergeHomeFiles allFiles [
         { include    = [ "*" ];
           exclude    = [ "*.png" ];
           emitter    = "symlink";
           destPrefix = ".config/hypr"; }
-        { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+        { include    = [ wallustRel ];
           emitter    = "copy";
           destPrefix = ".config/hypr"; }
       ];
     in {
-      # "copy" emitter produces { text = …; } — a real file, not a symlink
-      wallustHasText   = (r."${wallustKey}" or { }) ? text;
-      wallustNoSource  = ! ((r."${wallustKey}" or { }) ? source);
-      # everything else → { source = …; } symlink, no text
-      sysIsSymlink     = (r."${sysKey}" or { }) ? source;
-      sysNoText        = ! ((r."${sysKey}" or { }) ? text);
+      # wallust → activation script (real writable file after switch)
+      wallustNotInHome    = ! (result.homeFiles ? "${wallustKey}");
+      activationHasWallust = lib.hasInfix wallustRel result.activation;
+      activationHasCp      = lib.hasInfix "cp " result.activation;
+      # everything else → homeFiles as symlinks
+      sysInHome     = result.homeFiles ? "${sysKey}";
+      sysHasSource  = (result.homeFiles."${sysKey}" or { }) ? source;
       # include=[] ≡ include=["*"]
-      baseLayersEquiv  = r == r2;
+      baseLayersEquiv = result.homeFiles == result2.homeFiles
+                     && result.activation == result2.activation;
     };
 
-  # Scenario C: exclude hyprland.conf (managed by wayland.windowManager.hyprland)
-  # When home-manager's hyprland module manages hyprland.conf, exclude it
-  # from mergeHomeFiles to avoid the "Conflicting managed target files" error.
+  # Scenario C: exclude hyprland.conf
   t_mergeHomeFiles_excludeConflict =
     let
-      r = orc.mergeHomeFiles allFiles [
+      result = orc.mergeHomeFiles allFiles [
         { include    = [ ];
           exclude    = [ "hyprland.conf" "*.png" ];
           emitter    = "symlink";
           destPrefix = ".config/hypr"; }
       ];
     in {
-      noHyprlandConf = ! (r ? ".config/hypr/hyprland.conf");
-      hasSysFiles    = lib.any (lib.hasPrefix ".config/hypr/sys/") (builtins.attrNames r);
+      noHyprlandConf = ! (result.homeFiles ? ".config/hypr/hyprland.conf");
+      hasSysFiles    = lib.any
+        (lib.hasPrefix ".config/hypr/sys/")
+        (builtins.attrNames result.homeFiles);
+      activationEmpty = result.activation == "";
     };
 
   # ─────────────────────────────────────────────────────────────────────────

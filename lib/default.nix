@@ -159,13 +159,14 @@ let
   #
   # Entry → home.file value mapping:
   #   entry.text present → { text = entry.text; }
-  #                        home-manager writes a real file (not a symlink).
-  #                        This is the only way to produce a writable file.
+  #                        home-manager auto-sets source = pkgs.writeText …
+  #                        Still installed as a symlink, but to a store-generated file.
   #   otherwise          → { source = absPath; }  symlink into the Nix store
   #
-  # NOTE: `force = true` alone does NOT produce a writable physical file.
-  # It only controls whether home-manager replaces a pre-existing path.
-  # To get a writable file, use `text` (via transform or "copy" emitter).
+  # NOTE: home-manager ALWAYS installs home.file entries as symlinks.
+  # Neither `source` nor `text` produces a real writable file on disk.
+  # For runtime-writable files (e.g. wallust), use the "copy" emitter in
+  # mergeHomeFiles, which runs `cp` in the activation script instead.
   toHomeFiles = destPrefix: files:
     lib.mapAttrs'
       (relPath: entry:
@@ -268,27 +269,32 @@ let
     // lib.optionalAttrs (symlinkTree != null) { inherit symlinkTree; };
 
   # ── 3e: mergeHomeFiles ────────────────────────────────────────────────────
-  # Produces a single home.file attrset from a list of home-specific policies.
+  # Produces a result attrset from a list of home-specific policies:
+  #
+  #   {
+  #     homeFiles  :: attrset   suitable for home.file = …
+  #     activation :: string    suitable for home.activation.<name>.script = …
+  #   }
   #
   # Per-policy emitters:
-  #   "symlink"  → { source = absPath; }
-  #                home-manager creates a symlink into the Nix store (read-only).
+  #   "symlink"  → home.file entry: { source = absPath; }
+  #                home-manager creates a read-only symlink into the Nix store.
   #                Default. Use for stable config that is never written at runtime.
   #
-  #   "copy"     → { text = builtins.readFile absPath; }
-  #                home-manager writes the file content into a real file (writable).
-  #                Use for files that external tools write at runtime (e.g. wallust).
-  #                The content is read at eval time and baked into the Nix closure.
+  #   "copy"     → activation script: cp --remove-destination absPath target
+  #                Copies the file at activation time, producing a real writable file
+  #                on disk (not a symlink). Use for files that external tools write
+  #                at runtime (e.g. wallust). The copy runs on every `home-manager switch`.
   #
-  #   "text"     → { text = entry.text; }
-  #                Like "copy" but the text comes from a transform, not the source file.
-  #                Requires transform to inject entry.text; throws otherwise.
+  #   "text"     → home.file entry: { text = entry.text; }
+  #                Like "symlink" but content is inline text from a transform.
+  #                Still produces a symlink (home-manager always links for home.file).
+  #                Use for injecting headers; NOT suitable for runtime-writable files.
   #
-  # Why "copy" uses `text` and not `source + force`:
-  #   home-manager's `force = true` only controls whether a pre-existing path is
-  #   replaced — the result is still a symlink. The ONLY way to produce a real
-  #   writable file is to use the `text` field, which home-manager materialises
-  #   as a physical file rather than a symlink.
+  # Why "copy" uses activation and not home.file:
+  #   home-manager's home.file ALWAYS installs files as symlinks — regardless of
+  #   `force`, `text`, or `source`. The only way to produce a real writable file
+  #   is to cp it during the activation phase, after home-manager has finished linking.
   #
   # Per-policy fields (all optional):
   #   include    :: [ pattern ]   default: []  (accept everything)
@@ -298,16 +304,12 @@ let
   #   destPrefix :: string        default: ""
   #   priority   :: int           default: 5
   #
-  # Base-layer + point-override idiom (recommended):
-  #
-  #   mergeHomeFiles files [
-  #     # Base: all files as symlinks (include=[] ≡ include=["*"])
-  #     { emitter = "symlink"; destPrefix = ".config/hypr"; }
-  #     # Override: wallust writes this file at runtime → must be a real writable file
-  #     { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
-  #       emitter    = "copy";      # reads content, produces writable file
-  #       destPrefix = ".config/hypr"; }
-  #   ]
+  # Usage:
+  #   let result = orc.mergeHomeFiles files [ … ]; in
+  #   {
+  #     home.file = result.homeFiles;
+  #     home.activation.hyprCopy = lib.hm.dag.entryAfter [ "writeBoundary" ] result.activation;
+  #   }
   mergeHomeFiles = files: policies:
     let
       applyOneHomePolicy = policy:
@@ -330,34 +332,60 @@ let
           filtered    = lib.filterAttrs keep files;
           transformed = lib.mapAttrs (relPath: entry: p.transform relPath entry) filtered;
           cleaned     = lib.filterAttrs (_: v: v != null) transformed;
-
-          toEntry = relPath: entry:
-            let
-              key   = if p.destPrefix == "" then relPath
-                      else "${p.destPrefix}/${relPath}";
-              value =
-                if p.emitter == "copy" then
-                  # Read the file content at eval time.
-                  # home-manager's `text` path produces a real writable file,
-                  # whereas `source` always produces a read-only symlink.
-                  { text = builtins.readFile entry.absPath; }
-                else if p.emitter == "text" then
-                  if ! (entry ? text)
-                  then throw ''
-                    ConfigurationOrchestrator.mergeHomeFiles: emitter="text" requires
-                    a transform that sets entry.text, but "${relPath}" has no text field.
-                    Add: transform = _: e: e // { text = builtins.readFile e.absPath; };
-                  ''
-                  else { text = entry.text; }
-                else
-                  # "symlink" — read-only symlink into the Nix store
-                  { source = entry.absPath; };
-            in
-            lib.nameValuePair key value;
         in
-        lib.mapAttrs' toEntry cleaned;
+        # Return { homeFiles = { … }; activationCmds = [ "cmd" … ]; }
+        lib.foldl'
+          (acc: relPath:
+            let
+              entry  = cleaned.${relPath};
+              key    = if p.destPrefix == "" then relPath
+                       else "${p.destPrefix}/${relPath}";
+            in
+            if p.emitter == "copy" then
+              # Activation-time cp — produces a real writable file
+              acc // {
+                activationCmds = acc.activationCmds ++ [
+                  ''
+                    mkdir -p "$(dirname "$HOME/${key}")"
+                    cp --remove-destination ${lib.escapeShellArg entry.absPath} "$HOME/${key}"
+                    chmod u+w "$HOME/${key}"
+                  ''
+                ];
+              }
+            else if p.emitter == "text" then
+              if ! (entry ? text)
+              then throw ''
+                ConfigurationOrchestrator.mergeHomeFiles: emitter="text" requires
+                a transform that sets entry.text, but "${relPath}" has no text field.
+                Add: transform = _: e: e // { text = builtins.readFile e.absPath; };
+              ''
+              else
+                acc // {
+                  homeFiles = acc.homeFiles // { "${key}" = { text = entry.text; }; };
+                }
+            else
+              # "symlink" — read-only symlink into the Nix store
+              acc // {
+                homeFiles = acc.homeFiles // { "${key}" = { source = entry.absPath; }; };
+              })
+          { homeFiles = { }; activationCmds = [ ]; }
+          (builtins.attrNames cleaned);
+
+      # Fold all policies, merging homeFiles and accumulating activation cmds
+      folded = lib.foldl'
+        (acc: policy:
+          let result = applyOneHomePolicy policy; in
+          {
+            homeFiles      = acc.homeFiles // result.homeFiles;
+            activationCmds = acc.activationCmds ++ result.activationCmds;
+          })
+        { homeFiles = { }; activationCmds = [ ]; }
+        policies;
     in
-    lib.foldl' (acc: policy: acc // applyOneHomePolicy policy) { } policies;
+    {
+      homeFiles  = folded.homeFiles;
+      activation = lib.concatStringsSep "\n" folded.activationCmds;
+    };
 
   # ───────────────────────────────────────────────────────────────────────────
   # High-level entry point

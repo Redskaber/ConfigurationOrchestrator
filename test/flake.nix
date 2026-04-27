@@ -3,7 +3,11 @@
 
   inputs = {
     nixpkgs.url                    = "github:NixOS/nixpkgs/nixos-unstable";
-    configuration-orchestrator.url = "github:redskaber/ConfigurationOrchestrator";
+    # path:.. resolves to the parent directory (the library itself).
+    # This means local changes to lib/ take effect immediately without
+    # needing a push to GitHub. Run `nix flake update` only when you
+    # want to pull a specific pinned remote revision.
+    configuration-orchestrator.url = "path:..";
     hypr-config.url                = "github:redskaber/hypr-config";
     hypr-config.flake              = false;
   };
