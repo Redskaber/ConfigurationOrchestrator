@@ -154,19 +154,6 @@ let
       noSource   = ! ((r."hyprland.conf" or { }) ? source);
     };
 
-  t_toHomeFiles_force =
-    let
-      # Explicitly set force = true via transform
-      forceFiles = orc.applyPolicy {
-        include   = [ "hyprland.conf" ];
-        transform = _: entry: entry // { force = true; };
-      } allFiles;
-      r = orc.toHomeFiles "" forceFiles;
-    in {
-      hasForce  = (r."hyprland.conf" or { }).force or false;
-      hasSource = (r."hyprland.conf" or { }) ? source;
-    };
-
   # ─────────────────────────────────────────────────────────────────────────
   # Layer 3b · toDerivation / toSymlinkTree
   # ─────────────────────────────────────────────────────────────────────────
@@ -216,24 +203,21 @@ let
     };
 
   # Scenario B: base-layer + point-override (the recommended idiom)
-  # Use include=[] as the base layer, then override exactly one file.
   t_mergeHomeFiles_baseLayer =
     let
       wallustKey = ".config/hypr/sys/policy/wallust/wallust-hyprland.conf";
       sysKey     = ".config/hypr/sys/default.conf";
 
-      # include = [] as base (accepts all)
       r = orc.mergeHomeFiles allFiles [
         { include    = [ ];
           exclude    = [ "*.png" ];
           emitter    = "symlink";
           destPrefix = ".config/hypr"; }
         { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
-          emitter    = "copy";
+          emitter    = "copy";     # reads content → real writable file
           destPrefix = ".config/hypr"; }
       ];
 
-      # "*" is identical to [] as base
       r2 = orc.mergeHomeFiles allFiles [
         { include    = [ "*" ];
           exclude    = [ "*.png" ];
@@ -244,12 +228,12 @@ let
           destPrefix = ".config/hypr"; }
       ];
     in {
-      # wallust file → copy (force = true)
-      wallustIsCopy    = (r."${wallustKey}" or { }).force or false;
-      wallustHasSource = (r."${wallustKey}" or { }) ? source;
-      # everything else → symlink (no force)
+      # "copy" emitter produces { text = …; } — a real file, not a symlink
+      wallustHasText   = (r."${wallustKey}" or { }) ? text;
+      wallustNoSource  = ! ((r."${wallustKey}" or { }) ? source);
+      # everything else → { source = …; } symlink, no text
       sysIsSymlink     = (r."${sysKey}" or { }) ? source;
-      sysNoForce       = ! ((r."${sysKey}" or { }).force or false);
+      sysNoText        = ! ((r."${sysKey}" or { }) ? text);
       # include=[] ≡ include=["*"]
       baseLayersEquiv  = r == r2;
     };
@@ -425,7 +409,6 @@ let
     layer3 = {
       toHomeFiles_source      = t_toHomeFiles_source;
       toHomeFiles_text        = t_toHomeFiles_text;
-      toHomeFiles_force       = t_toHomeFiles_force;
       toDerivation            = t_toDerivation;
       toSymlinkTree           = t_toSymlinkTree;
       mergeHomeFiles_explicit = t_mergeHomeFiles_explicit;

@@ -158,12 +158,14 @@ let
   # destPrefix is prepended to every key.
   #
   # Entry → home.file value mapping:
-  #   entry.text present    → { text = entry.text; }
-  #   entry.force = true    → { source = absPath; force = true; }
-  #   otherwise             → { source = absPath; }          plain symlink
+  #   entry.text present → { text = entry.text; }
+  #                        home-manager writes a real file (not a symlink).
+  #                        This is the only way to produce a writable file.
+  #   otherwise          → { source = absPath; }  symlink into the Nix store
   #
-  # `force` is opt-in: set via transform (entry // { force = true; }) or via
-  # the "copy" emitter in mergeHomeFiles. Plain "homeFiles" policy = symlink.
+  # NOTE: `force = true` alone does NOT produce a writable physical file.
+  # It only controls whether home-manager replaces a pre-existing path.
+  # To get a writable file, use `text` (via transform or "copy" emitter).
   toHomeFiles = destPrefix: files:
     lib.mapAttrs'
       (relPath: entry:
@@ -171,10 +173,9 @@ let
           key   = if destPrefix == "" then relPath
                   else "${destPrefix}/${relPath}";
           value =
-            (if entry ? text
-             then { text = entry.text; }
-             else { source = entry.absPath; })
-            // lib.optionalAttrs (entry.force or false) { force = true; };
+            if entry ? text
+            then { text = entry.text; }
+            else { source = entry.absPath; };
         in
         lib.nameValuePair key value)
       files;
@@ -268,14 +269,26 @@ let
 
   # ── 3e: mergeHomeFiles ────────────────────────────────────────────────────
   # Produces a single home.file attrset from a list of home-specific policies.
-  # This is the recommended API when `home.file` is your sole integration point
-  # and you need per-file emitter control without separate derivations.
   #
   # Per-policy emitters:
-  #   "symlink"  → { source = absPath; }                   plain symlink (default)
-  #   "copy"     → { source = absPath; force = true; }     physical copy
-  #   "text"     → { text = entry.text; }                  inline text
-  #                  REQUIRES transform to inject entry.text; throws otherwise.
+  #   "symlink"  → { source = absPath; }
+  #                home-manager creates a symlink into the Nix store (read-only).
+  #                Default. Use for stable config that is never written at runtime.
+  #
+  #   "copy"     → { text = builtins.readFile absPath; }
+  #                home-manager writes the file content into a real file (writable).
+  #                Use for files that external tools write at runtime (e.g. wallust).
+  #                The content is read at eval time and baked into the Nix closure.
+  #
+  #   "text"     → { text = entry.text; }
+  #                Like "copy" but the text comes from a transform, not the source file.
+  #                Requires transform to inject entry.text; throws otherwise.
+  #
+  # Why "copy" uses `text` and not `source + force`:
+  #   home-manager's `force = true` only controls whether a pre-existing path is
+  #   replaced — the result is still a symlink. The ONLY way to produce a real
+  #   writable file is to use the `text` field, which home-manager materialises
+  #   as a physical file rather than a symlink.
   #
   # Per-policy fields (all optional):
   #   include    :: [ pattern ]   default: []  (accept everything)
@@ -290,14 +303,11 @@ let
   #   mergeHomeFiles files [
   #     # Base: all files as symlinks (include=[] ≡ include=["*"])
   #     { emitter = "symlink"; destPrefix = ".config/hypr"; }
-  #     # Override: wallust writes this file at runtime → must be a real copy
+  #     # Override: wallust writes this file at runtime → must be a real writable file
   #     { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
-  #       emitter    = "copy";
+  #       emitter    = "copy";      # reads content, produces writable file
   #       destPrefix = ".config/hypr"; }
   #   ]
-  #
-  # Conflict resolution: later policies silently override earlier ones
-  # for the same destination key (last-wins).
   mergeHomeFiles = files: policies:
     let
       applyOneHomePolicy = policy:
@@ -326,19 +336,21 @@ let
               key   = if p.destPrefix == "" then relPath
                       else "${p.destPrefix}/${relPath}";
               value =
-                if p.emitter == "text" then
-                  # Guard: transform must have injected a `text` field.
+                if p.emitter == "copy" then
+                  # Read the file content at eval time.
+                  # home-manager's `text` path produces a real writable file,
+                  # whereas `source` always produces a read-only symlink.
+                  { text = builtins.readFile entry.absPath; }
+                else if p.emitter == "text" then
                   if ! (entry ? text)
                   then throw ''
                     ConfigurationOrchestrator.mergeHomeFiles: emitter="text" requires
-                    a transform that sets entry.text, but file "${relPath}" has no text
-                    field after transform. Add a transform, e.g.:
-                      transform = _: e: e // { text = builtins.readFile e.absPath; };
+                    a transform that sets entry.text, but "${relPath}" has no text field.
+                    Add: transform = _: e: e // { text = builtins.readFile e.absPath; };
                   ''
                   else { text = entry.text; }
-                else if p.emitter == "copy" then
-                  { source = entry.absPath; force = true; }
                 else
+                  # "symlink" — read-only symlink into the Nix store
                   { source = entry.absPath; };
             in
             lib.nameValuePair key value;

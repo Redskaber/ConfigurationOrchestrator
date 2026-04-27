@@ -17,12 +17,12 @@ flake.nix          — public interface: lib.<system>
 `xdg.configFile` and `home.file` in home-manager apply one strategy to the
 whole tree. In practice you need finer control:
 
-| Scenario                                        | Best strategy                  |
-| ----------------------------------------------- | ------------------------------ |
-| `sys/` — read-only stable config                | symlink (fast, zero copy)      |
-| `user/` — personal overrides                    | `home.file` source             |
-| One file written by an external tool at runtime | physical copy (`force = true`) |
-| A file needs a header injected                  | derivation + transform         |
+| Scenario                                        | Best strategy                           |
+| ----------------------------------------------- | --------------------------------------- |
+| `sys/` — read-only stable config                | symlink (fast, zero copy)               |
+| `user/` — personal overrides                    | `home.file` source                      |
+| One file written by an external tool at runtime | `emitter = "copy"` (real writable file) |
+| A file needs a header injected                  | derivation + transform                  |
 
 There is no standard primitive for "symlink these, copy that one, patch this
 one" at file granularity. ConfigurationOrchestrator is that primitive.
@@ -56,9 +56,9 @@ src (path)
 
      ─── mergeHomeFiles (home.file-only path) ──────────────────────
      Produces one home.file attrset with per-file emitter control:
-       "symlink"  → { source = absPath; }
-       "copy"     → { source = absPath; force = true; }
-       "text"     → { text = entry.text; }
+       "symlink"  → { source = absPath; }              read-only symlink
+       "copy"     → { text = readFile absPath; }        real writable file
+       "text"     → { text = entry.text; }              real writable file
 ```
 
 **Core design principle:** the emitter is a property of each file, set by
@@ -170,14 +170,13 @@ toSymlinkTree { pkgs, name, files }     # → store path (symlink tree)
 
 `toHomeFiles` entry → home.file value:
 
-| Entry field          | home.file value                       |
-| -------------------- | ------------------------------------- |
-| `entry.text` present | `{ text = …; }`                       |
-| `entry.force = true` | `{ source = …; force = true; }`       |
-| otherwise            | `{ source = absPath; }` plain symlink |
+| Entry field          | home.file value                             |
+| -------------------- | ------------------------------------------- |
+| `entry.text` present | `{ text = …; }` — real writable file        |
+| otherwise            | `{ source = absPath; }` — read-only symlink |
 
-`force` is opt-in. Set via `transform = _: e: e // { force = true; }` or via
-the `"copy"` emitter in `mergeHomeFiles`.
+To get a writable file, use `entry.text` (via transform or `"copy"` emitter in
+`mergeHomeFiles`). `source` always produces a symlink, regardless of `force`.
 
 ### `emit` — multi-emitter dispatch
 
@@ -199,11 +198,18 @@ mergeHomeFiles files policies
 
 Per-policy emitters:
 
-| `emitter`   | home.file value                       | notes                             |
-| ----------- | ------------------------------------- | --------------------------------- |
-| `"symlink"` | `{ source = absPath; }`               | default                           |
-| `"copy"`    | `{ source = absPath; force = true; }` | wallust, dynamic files            |
-| `"text"`    | `{ text = entry.text; }`              | requires transform to inject text |
+| `emitter`   | home.file value                         | result                                     |
+| ----------- | --------------------------------------- | ------------------------------------------ |
+| `"symlink"` | `{ source = absPath; }`                 | read-only symlink into Nix store           |
+| `"copy"`    | `{ text = builtins.readFile absPath; }` | **real writable file**                     |
+| `"text"`    | `{ text = entry.text; }`                | real writable file, content from transform |
+
+**Why `"copy"` uses `text` and not `source + force`:**
+`force = true` in home-manager only controls whether a pre-existing path gets
+replaced before linking — the result is still a read-only symlink into the Nix
+store. The only way to produce a real writable file is via the `text` field,
+which home-manager materialises as a physical file on disk. `"copy"` reads the
+source file content at eval time (`builtins.readFile`) and passes it as `text`.
 
 `"text"` without a transform that sets `entry.text` throws a descriptive error.
 
@@ -410,11 +416,18 @@ transform = _: entry: if entry.type == "symlink" then null else entry;
 files = orc.listFilesRecursiveFiltered src "" [ "symlink" ];
 ```
 
-**Force a file to be a physical copy:**
+**Produce a writable physical file (for tools that write at runtime):**
 
 ```nix
-transform = _: entry: entry // { force = true; };
-# Or use emitter = "copy" in mergeHomeFiles.
+# In mergeHomeFiles — reads content at eval time, home-manager writes a real file:
+{ include = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+  emitter = "copy";
+  destPrefix = ".config/hypr"; }
+
+# Via transform — same mechanism, manual text injection:
+transform = _: entry: entry // { text = builtins.readFile entry.absPath; };
+# Note: force=true alone does NOT produce a writable file; it only controls
+# whether home-manager replaces a pre-existing path before creating a symlink.
 ```
 
 ---
