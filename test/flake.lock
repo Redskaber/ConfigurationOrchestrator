@@ -5,11 +5,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1777313935,
-        "narHash": "sha256-0cL4xA4XQdCQp26HJOXJV9pjHpPhdauhCFuJWMdT1NU=",
+        "lastModified": 1777314500,
+        "narHash": "sha256-WBCffnSRU0ImEIiKNqFDwrn7US0u/Yr9GgMtxoyXZ70=",
         "owner": "redskaber",
         "repo": "ConfigurationOrchestrator",
-        "rev": "5d53e8a375cf1ad82c2ef6d00fe5810f42799c9d",
+        "rev": "c343500062c49e5d214f4249736aaa666c7b3cc2",
         "type": "github"
       },
       "original": {
