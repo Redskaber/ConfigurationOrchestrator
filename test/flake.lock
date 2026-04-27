@@ -1,5 +1,23 @@
 {
   "nodes": {
+    "configuration-orchestrator": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1777312822,
+        "narHash": "sha256-pf6nXzivu1OSt3UEJbm2ghi2GTJ292p8s1dKNanjqAA=",
+        "owner": "redskaber",
+        "repo": "ConfigurationOrchestrator",
+        "rev": "030dce07183495d6ec5c0b60332670cfc654fa69",
+        "type": "github"
+      },
+      "original": {
+        "owner": "redskaber",
+        "repo": "ConfigurationOrchestrator",
+        "type": "github"
+      }
+    },
     "hypr-config": {
       "flake": false,
       "locked": {
@@ -32,10 +50,27 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1776877367,
+        "narHash": "sha256-EHq1/OX139R1RvBzOJ0aMRT3xnWyqtHBRUBuO1gFzjI=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0726a0ecb6d4e08f6adced58726b95db924cef57",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
+        "configuration-orchestrator": "configuration-orchestrator",
         "hypr-config": "hypr-config",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs_2"
       }
     }
   },

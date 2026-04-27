@@ -237,6 +237,66 @@ let
     // lib.optionalAttrs (derivation  != null) { inherit derivation; }
     // lib.optionalAttrs (symlinkTree != null) { inherit symlinkTree; };
 
+  # ── 3d: mergeHomeFiles ───────────────────────────────────────────────────
+  # Convenience function: applies a list of home-file-specific policies to
+  # `files` and merges the results into a single home.file attrset.
+  #
+  # Each policy may specify:
+  #   include / exclude / transform  — same as applyPolicy
+  #   emitter   :: "symlink" | "copy" | "text"
+  #                 "symlink" → { source = absPath; }            (default)
+  #                 "copy"    → { source = absPath; force = true; }
+  #                 "text"    → { text = entry.text; }  (requires transform)
+  #   destPrefix :: string   (default: "")
+  #   priority   :: int      (default: 5)
+  #
+  # This solves the home-manager granularity problem: within a single
+  # home.file attrset you can have some files as plain symlinks, some as
+  # forced copies, and some as inline text — all from one call.
+  mergeHomeFiles = files: policies:
+    let
+      applyOneHomePolicy = policy:
+        let
+          p = {
+            include    = [ ];
+            exclude    = [ ];
+            transform  = _: entry: entry;
+            emitter    = "symlink";    # "symlink" | "copy" | "text"
+            destPrefix = "";
+            priority   = 5;
+          } // policy;
+
+          keep = relPath: _:
+            let
+              included = p.include == [ ] || matchesAny relPath p.include;
+              excluded = p.exclude != [ ] && matchesAny relPath p.exclude;
+            in included && !excluded;
+
+          filtered    = lib.filterAttrs keep files;
+          transformed = lib.mapAttrs p.transform filtered;
+          cleaned     = lib.filterAttrs (_: v: v != null) transformed;
+
+          toEntry = relPath: entry:
+            let
+              key = if p.destPrefix == "" then relPath
+                    else "${p.destPrefix}/${relPath}";
+              value =
+                if p.emitter == "text" then
+                  { text = entry.text; }
+                else if p.emitter == "copy" then
+                  { source = entry.absPath; force = true; }
+                else
+                  # "symlink" — plain home.file source link
+                  { source = entry.absPath; };
+            in
+            lib.nameValuePair key value;
+        in
+        lib.mapAttrs' toEntry cleaned;
+
+    in
+    # Fold all policy results; later policies override earlier ones
+    lib.foldl' (acc: policy: acc // applyOneHomePolicy policy) { } policies;
+
   # ───────────────────────────────────────────────────────────────────────────
   # High-level entry point
   # ───────────────────────────────────────────────────────────────────────────
@@ -295,6 +355,7 @@ in
     toDerivation
     toSymlinkTree
     emit
+    mergeHomeFiles
     # High-level
     readConfigDir;
 }
