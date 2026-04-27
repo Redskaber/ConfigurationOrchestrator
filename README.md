@@ -55,10 +55,10 @@ src (path)
      Returns: { homeFiles; ?derivation; ?symlinkTree; }
 
      ─── mergeHomeFiles (home.file-only path) ──────────────────────
-     Produces one home.file attrset with per-file emitter control:
-       "symlink"  → { source = absPath; }              read-only symlink
-       "copy"     → { text = readFile absPath; }        real writable file
-       "text"     → { text = entry.text; }              real writable file
+     Produces { homeFiles; activation } with per-file emitter control:
+       "symlink"  → homeFiles   { source = absPath; }   read-only symlink
+       "copy"     → activation  cp absPath $HOME/key     real writable file
+       "text"     → homeFiles   { text = entry.text; }  symlink to generated file
 ```
 
 **Core design principle:** the emitter is a property of each file, set by
@@ -170,13 +170,14 @@ toSymlinkTree { pkgs, name, files }     # → store path (symlink tree)
 
 `toHomeFiles` entry → home.file value:
 
-| Entry field          | home.file value                             |
-| -------------------- | ------------------------------------------- |
-| `entry.text` present | `{ text = …; }` — real writable file        |
-| otherwise            | `{ source = absPath; }` — read-only symlink |
+| Entry field          | home.file value         | installed as                           |
+| -------------------- | ----------------------- | -------------------------------------- |
+| `entry.text` present | `{ text = …; }`         | symlink to a store-generated text file |
+| otherwise            | `{ source = absPath; }` | symlink into the Nix store             |
 
-To get a writable file, use `entry.text` (via transform or `"copy"` emitter in
-`mergeHomeFiles`). `source` always produces a symlink, regardless of `force`.
+**home-manager always installs `home.file` entries as symlinks** — both `source`
+and `text` produce symlinks. For a real writable file use `emitter = "copy"` in
+`mergeHomeFiles`, which runs `cp` in the activation script instead.
 
 ### `emit` — multi-emitter dispatch
 

@@ -5,18 +5,14 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1777330386,
-        "narHash": "sha256-Do9oEzSX6ei2lFLYCGjpyVh6rO5oNKaHUDPfba38sRY=",
-        "owner": "redskaber",
-        "repo": "ConfigurationOrchestrator",
-        "rev": "b4bdfbdade34959ef2c8286085354ef7b9b25db9",
-        "type": "github"
+        "path": "..",
+        "type": "path"
       },
       "original": {
-        "owner": "redskaber",
-        "repo": "ConfigurationOrchestrator",
-        "type": "github"
-      }
+        "path": "..",
+        "type": "path"
+      },
+      "parent": []
     },
     "hypr-config": {
       "flake": false,

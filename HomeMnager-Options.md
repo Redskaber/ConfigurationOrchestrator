@@ -1,5 +1,30 @@
 # Home Manager Options
 
+home.activation
+The activation scripts blocks to run when activating a Home Manager generation. Any entry here should be idempotent, meaning running twice or more times produces the same result as running it once.
+If the script block produces any observable side effect, such as writing or deleting files, then it must be placed after the special writeBoundary script block. Prior to the write boundary one can place script blocks that verifies, but does not modify, the state of the system and exits if an unexpected state is found. For example, the checkLinkTargets script block checks for collisions between non-managed files and files defined in home.file.
+A script block should respect the DRY_RUN variable. If it is set then the actions taken by the script should be logged to standard out and not actually performed. A convenient shell function run is provided for activation script blocks. It is used as follows:
+run {command}
+Runs the given command on live run, otherwise prints the command to standard output.
+run --quiet {command}
+Runs the given command on live run and sends its standard output to /dev/null, otherwise prints the command to standard output.
+run --silence {command}
+Runs the given command on live run and sends its standard and error output to /dev/null, otherwise prints the command to standard output.
+The --quiet and --silence flags are mutually exclusive.
+A script block should also respect the VERBOSE variable, and if set print information on standard out that may be useful for debugging any issue that may arise. The variable VERBOSE_ARG is set to --verbose if verbose output is enabled. You can also use the provided shell function verboseEcho, which acts as echo when verbose output is enabled.
+Type: DAG of string
+Default:
+{ }
+Example:
+{
+myActivationAction = lib.hm.dag.entryAfter ["writeBoundary"] ''
+run ln -s $VERBOSE_ARG \
+ ${builtins.toPath ./link-me-directly} $HOME
+'';
+}
+Declared by:
+<home-manager/modules/home-environment.nix>
+
 home.file
 Attribute set of files to link into the user home.
 Type: attribute set of (submodule)

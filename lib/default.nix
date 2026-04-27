@@ -272,8 +272,8 @@ let
   # Produces a result attrset from a list of home-specific policies:
   #
   #   {
-  #     homeFiles  :: attrset   suitable for home.file = …
-  #     activation :: string    suitable for home.activation.<name>.script = …
+  #     homeFiles  :: attrset   suitable for home.file = result.homeFiles
+  #     activation :: string    suitable for home.activation.<name>.script = result.activation
   #   }
   #
   # Per-policy emitters:
@@ -281,38 +281,34 @@ let
   #                home-manager creates a read-only symlink into the Nix store.
   #                Default. Use for stable config that is never written at runtime.
   #
-  #   "copy"     → activation script: cp --remove-destination absPath target
-  #                Copies the file at activation time, producing a real writable file
-  #                on disk (not a symlink). Use for files that external tools write
-  #                at runtime (e.g. wallust). The copy runs on every `home-manager switch`.
+  #   "copy"     → activation script: cp --remove-destination absPath $HOME/key
+  #                Copies the file at activation time → real writable file on disk.
+  #                Also removes the key from homeFiles if a prior policy put it there.
+  #                Use for files that external tools write at runtime (e.g. wallust).
   #
   #   "text"     → home.file entry: { text = entry.text; }
-  #                Like "symlink" but content is inline text from a transform.
-  #                Still produces a symlink (home-manager always links for home.file).
-  #                Use for injecting headers; NOT suitable for runtime-writable files.
+  #                Requires transform to inject entry.text; throws otherwise.
   #
-  # Why "copy" uses activation and not home.file:
-  #   home-manager's home.file ALWAYS installs files as symlinks — regardless of
+  # Why "copy" uses home.activation and not home.file:
+  #   home-manager's home.file ALWAYS installs files as symlinks, regardless of
   #   `force`, `text`, or `source`. The only way to produce a real writable file
-  #   is to cp it during the activation phase, after home-manager has finished linking.
+  #   is to cp it during the activation phase.
   #
-  # Per-policy fields (all optional):
-  #   include    :: [ pattern ]   default: []  (accept everything)
-  #   exclude    :: [ pattern ]   default: []  (drop nothing)
-  #   transform  :: relPath → entry → entry | null
-  #   emitter    :: "symlink" | "copy" | "text"
-  #   destPrefix :: string        default: ""
-  #   priority   :: int           default: 5
+  # Policies apply in order; LAST matching policy wins per file.
+  # A "copy" policy overrides a prior "symlink" policy for the same key:
+  #   the key is removed from homeFiles and added to the activation script.
   #
   # Usage:
   #   let result = orc.mergeHomeFiles files [ … ]; in
   #   {
   #     home.file = result.homeFiles;
-  #     home.activation.hyprCopy = lib.hm.dag.entryAfter [ "writeBoundary" ] result.activation;
+  #     home.activation.myScript = lib.hm.dag.entryAfter ["writeBoundary"] result.activation;
   #   }
   mergeHomeFiles = files: policies:
     let
-      applyOneHomePolicy = policy:
+      # For each policy, produce a flat list of decisions:
+      # { key; emitter; absPath; ?text; }
+      policyDecisions = policy:
         let
           p = {
             include    = [ ];
@@ -333,58 +329,66 @@ let
           transformed = lib.mapAttrs (relPath: entry: p.transform relPath entry) filtered;
           cleaned     = lib.filterAttrs (_: v: v != null) transformed;
         in
-        # Return { homeFiles = { … }; activationCmds = [ "cmd" … ]; }
+        lib.mapAttrs
+          (relPath: entry: {
+            key     = if p.destPrefix == "" then relPath else "${p.destPrefix}/${relPath}";
+            emitter = p.emitter;
+            absPath = entry.absPath;
+            text    = entry.text or null;
+          })
+          cleaned;
+
+      # Fold policies in order: later decisions override earlier ones per key.
+      # We track decisions as a map keyed by destination key.
+      allDecisions =
         lib.foldl'
-          (acc: relPath:
-            let
-              entry  = cleaned.${relPath};
-              key    = if p.destPrefix == "" then relPath
-                       else "${p.destPrefix}/${relPath}";
+          (acc: policy:
+            let decisions = policyDecisions policy;
             in
-            if p.emitter == "copy" then
-              # Activation-time cp — produces a real writable file
+            # For each decision from this policy, override the previous decision
+            # for the same key (last-wins).
+            lib.foldl'
+              (innerAcc: relPath:
+                let d = decisions.${relPath};
+                in innerAcc // { "${d.key}" = d; })
+              acc
+              (builtins.attrNames decisions))
+          { }
+          policies;
+
+      # Now split final decisions into homeFiles and activationCmds
+      finalResult =
+        lib.foldl'
+          (acc: key:
+            let d = allDecisions.${key}; in
+            if d.emitter == "copy" then
               acc // {
                 activationCmds = acc.activationCmds ++ [
                   ''
                     mkdir -p "$(dirname "$HOME/${key}")"
-                    cp --remove-destination ${lib.escapeShellArg entry.absPath} "$HOME/${key}"
+                    cp --remove-destination ${lib.escapeShellArg d.absPath} "$HOME/${key}"
                     chmod u+w "$HOME/${key}"
                   ''
                 ];
               }
-            else if p.emitter == "text" then
-              if ! (entry ? text)
+            else if d.emitter == "text" then
+              if d.text == null
               then throw ''
                 ConfigurationOrchestrator.mergeHomeFiles: emitter="text" requires
-                a transform that sets entry.text, but "${relPath}" has no text field.
+                a transform that sets entry.text, but key "${key}" has no text.
                 Add: transform = _: e: e // { text = builtins.readFile e.absPath; };
               ''
               else
-                acc // {
-                  homeFiles = acc.homeFiles // { "${key}" = { text = entry.text; }; };
-                }
+                acc // { homeFiles = acc.homeFiles // { "${key}" = { text = d.text; }; }; }
             else
-              # "symlink" — read-only symlink into the Nix store
-              acc // {
-                homeFiles = acc.homeFiles // { "${key}" = { source = entry.absPath; }; };
-              })
+              # "symlink"
+              acc // { homeFiles = acc.homeFiles // { "${key}" = { source = d.absPath; }; }; })
           { homeFiles = { }; activationCmds = [ ]; }
-          (builtins.attrNames cleaned);
-
-      # Fold all policies, merging homeFiles and accumulating activation cmds
-      folded = lib.foldl'
-        (acc: policy:
-          let result = applyOneHomePolicy policy; in
-          {
-            homeFiles      = acc.homeFiles // result.homeFiles;
-            activationCmds = acc.activationCmds ++ result.activationCmds;
-          })
-        { homeFiles = { }; activationCmds = [ ]; }
-        policies;
+          (builtins.attrNames allDecisions);
     in
     {
-      homeFiles  = folded.homeFiles;
-      activation = lib.concatStringsSep "\n" folded.activationCmds;
+      homeFiles  = finalResult.homeFiles;
+      activation = lib.concatStringsSep "\n" finalResult.activationCmds;
     };
 
   # ───────────────────────────────────────────────────────────────────────────
