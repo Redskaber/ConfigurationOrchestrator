@@ -25,21 +25,44 @@ let
       hasSysFile      = lib.any (lib.hasPrefix "sys/") (builtins.attrNames r);
       entryHasAbsPath = r."hyprland.conf".absPath ==
                           "${builtins.toString src}/hyprland.conf";
+      # hypr-config root contains symlinks (hypridle.conf → sys/hypridle.conf)
+      hasSymlinks     = lib.any
+        (k: (r.${k}).type == "symlink") (builtins.attrNames r);
+    };
+
+  # listFilesRecursiveFiltered drops symlinks at discovery time
+  t_listFilesRecursiveFiltered =
+    let
+      all      = orc.listFilesRecursive src "";
+      filtered = orc.listFilesRecursiveFiltered src "" [ "symlink" ];
+    in {
+      fewerThanAll  = (builtins.length (builtins.attrNames filtered)) <
+                      (builtins.length (builtins.attrNames all));
+      noSymlinks    = lib.all
+        (k: (filtered.${k}).type != "symlink")
+        (builtins.attrNames filtered);
+      stillHasConfs = lib.any (lib.hasSuffix ".conf") (builtins.attrNames filtered);
     };
 
   # ─────────────────────────────────────────────────────────────────────────
   # Layer 2 · Policy Engine
   # ─────────────────────────────────────────────────────────────────────────
 
-  allFiles = orc.listFilesRecursive src "";
+  # Use filtered files as base — avoids symlink-aliased duplicates in tests
+  allFiles     = orc.listFilesRecursiveFiltered src "" [ "symlink" ];
+  allFilesRaw  = orc.listFilesRecursive src "";   # includes symlinks
 
   t_matchesPattern = {
-    prefixMatch = orc.matchesPattern "sys/foo.conf"   "sys/";
-    suffixMatch = orc.matchesPattern "sys/foo.conf"   "*.conf";
-    globPrefix  = orc.matchesPattern "sys/policy/bar" "sys/*";
-    exactPrefix = orc.matchesPattern "hyprland.conf"  "hyprland";
-    noMatch     = ! orc.matchesPattern "user/bar"     "sys/";
-    regexMatch  = orc.matchesPattern "sys/foo.conf"   "/sys/.*[.]conf/";
+    prefixMatch   = orc.matchesPattern "sys/foo.conf"   "sys/";
+    suffixMatch   = orc.matchesPattern "sys/foo.conf"   "*.conf";
+    globPrefix    = orc.matchesPattern "sys/policy/bar" "sys/*";
+    exactPrefix   = orc.matchesPattern "hyprland.conf"  "hyprland";
+    noMatch       = ! orc.matchesPattern "user/bar"     "sys/";
+    regexMatch    = orc.matchesPattern "sys/foo.conf"   "/sys/.*[.]conf/";
+    # Universal wildcard
+    starMatchesSys  = orc.matchesPattern "sys/foo.conf"   "*";
+    starMatchesRoot = orc.matchesPattern "hyprland.conf"  "*";
+    starMatchesUser = orc.matchesPattern "user/bar.conf"  "*";
   };
 
   t_applyPolicy_include =
@@ -70,21 +93,18 @@ let
     let
       r = orc.applyPolicy {
         transform = _: entry: if entry.type == "symlink" then null else entry;
-      } allFiles;
+      } allFilesRaw;
     in {
       noSymlinks = lib.all (p: r.${p}.type != "symlink") (builtins.attrNames r);
     };
 
-  # emitter field is passed through to each entry
   t_applyPolicy_emitter =
-    let
-      r = orc.applyPolicy { include = [ "sys/" ]; emitter = "symlinkTree"; } allFiles;
-    in {
+    let r = orc.applyPolicy { include = [ "sys/" ]; emitter = "symlinkTree"; } allFiles; in {
       allAreSymlinkTree = lib.all
         (p: r.${p}.emitter == "symlinkTree") (builtins.attrNames r);
     };
 
-  # last policy wins for overlapping paths
+  # Last-wins: sys/→symlinkTree, user/→homeFiles; no overlap → both survive
   t_applyPolicies_lastWins =
     let
       r = orc.applyPolicies [
@@ -92,15 +112,15 @@ let
         { include = [ "user/" ]; emitter = "homeFiles";   priority = 20; }
       ] allFiles;
     in {
-      hasSysFiles   = lib.any (lib.hasPrefix "sys/")  (builtins.attrNames r);
-      hasUserFiles  = lib.any (lib.hasPrefix "user/") (builtins.attrNames r);
-      noOtherFiles  = lib.all
+      hasSysFiles  = lib.any (lib.hasPrefix "sys/")  (builtins.attrNames r);
+      hasUserFiles = lib.any (lib.hasPrefix "user/") (builtins.attrNames r);
+      noOtherFiles = lib.all
         (p: lib.hasPrefix "sys/" p || lib.hasPrefix "user/" p)
         (builtins.attrNames r);
-      sysIsSymlink  =
+      sysIsSymlink =
         let sysFiles = lib.filterAttrs (p: _: lib.hasPrefix "sys/" p) r;
         in lib.all (e: e.emitter == "symlinkTree") (builtins.attrValues sysFiles);
-      userIsHome    =
+      userIsHome   =
         let userFiles = lib.filterAttrs (p: _: lib.hasPrefix "user/" p) r;
         in lib.all (e: e.emitter == "homeFiles") (builtins.attrValues userFiles);
     };
@@ -111,19 +131,17 @@ let
 
   sysFiles = orc.applyPolicy { include = [ "sys/" ]; } allFiles;
 
-  # source-based entry: { source = absPath; }  — no force for plain symlinks
   t_toHomeFiles_source =
     let r = orc.toHomeFiles ".config/hypr" sysFiles; in {
       isAttrset      = builtins.isAttrs r;
       nonEmpty       = r != { };
       keysHavePrefix = lib.all
         (lib.hasPrefix ".config/hypr/sys/") (builtins.attrNames r);
-      hasSource      = (lib.head (builtins.attrValues r)) ? source;
-      # plain homeFiles entries have no force (force is opt-in via entry.force)
-      noForce        = ! ((lib.head (builtins.attrValues r)).force or false);
+      hasSource = (lib.head (builtins.attrValues r)) ? source;
+      # plain homeFiles entries have no force — force is opt-in
+      noForce   = ! ((lib.head (builtins.attrValues r)).force or false);
     };
 
-  # text-based entry (transform injects text field)
   t_toHomeFiles_text =
     let
       textFiles = orc.applyPolicy {
@@ -132,12 +150,25 @@ let
       } allFiles;
       r = orc.toHomeFiles "" textFiles;
     in {
-      hasTextKey  = (r."hyprland.conf" or { }) ? text;
-      noSource    = ! ((r."hyprland.conf" or { }) ? source);
+      hasTextKey = (r."hyprland.conf" or { }) ? text;
+      noSource   = ! ((r."hyprland.conf" or { }) ? source);
+    };
+
+  t_toHomeFiles_force =
+    let
+      # Explicitly set force = true via transform
+      forceFiles = orc.applyPolicy {
+        include   = [ "hyprland.conf" ];
+        transform = _: entry: entry // { force = true; };
+      } allFiles;
+      r = orc.toHomeFiles "" forceFiles;
+    in {
+      hasForce  = (r."hyprland.conf" or { }).force or false;
+      hasSource = (r."hyprland.conf" or { }) ? source;
     };
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Layer 3b · toDerivation
+  # Layer 3b · toDerivation / toSymlinkTree
   # ─────────────────────────────────────────────────────────────────────────
 
   t_toDerivation =
@@ -145,24 +176,17 @@ let
       isDrvPath = builtins.isString (builtins.unsafeDiscardStringContext "${drv}");
     };
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # Layer 3c · toSymlinkTree
-  # ─────────────────────────────────────────────────────────────────────────
-
   t_toSymlinkTree =
     let drv = orc.toSymlinkTree { inherit pkgs; name = "test-sym"; files = sysFiles; }; in {
       isDrvPath = builtins.isString (builtins.unsafeDiscardStringContext "${drv}");
     };
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Layer 3d · mergeHomeFiles
-  # Mixed emitter within a single home.file attrset:
-  #   sys/          → symlink  (plain source, no force)
-  #   sys/hardware/ → copy     (force = true, overrides sys/ policy)
-  #   hyprland.conf → text     (inline text, no source)
+  # Layer 3c · mergeHomeFiles
   # ─────────────────────────────────────────────────────────────────────────
 
-  t_mergeHomeFiles =
+  # Scenario A: explicit per-directory policies
+  t_mergeHomeFiles_explicit =
     let
       r = orc.mergeHomeFiles allFiles [
         { include    = [ "sys/" ];
@@ -183,25 +207,77 @@ let
       isAttrset    = builtins.isAttrs r;
       nonEmpty     = r != { };
       sysPresent   = r ? "${sysKey}";
-      # "symlink" → { source; }  no force
       sysHasSource = (r."${sysKey}"  or { }) ? source;
-      sysNoForce   = ! ((r."${sysKey}" or { }).force or false);
-      # "copy"    → { source; force = true; }
+      sysNoForce   = ! ((r."${sysKey}"  or { }).force or false);
       hwHasForce   = (r."${hwKey}"   or { }).force or false;
       hwHasSource  = (r."${hwKey}"   or { }) ? source;
-      # "text"    → { text; }  no source
       hyprHasText  = (r."${hyprKey}" or { }) ? text;
       hyprNoSource = ! ((r."${hyprKey}" or { }) ? source);
     };
 
+  # Scenario B: base-layer + point-override (the recommended idiom)
+  # Use include=[] as the base layer, then override exactly one file.
+  t_mergeHomeFiles_baseLayer =
+    let
+      wallustKey = ".config/hypr/sys/policy/wallust/wallust-hyprland.conf";
+      sysKey     = ".config/hypr/sys/default.conf";
+
+      # include = [] as base (accepts all)
+      r = orc.mergeHomeFiles allFiles [
+        { include    = [ ];
+          exclude    = [ "*.png" ];
+          emitter    = "symlink";
+          destPrefix = ".config/hypr"; }
+        { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+          emitter    = "copy";
+          destPrefix = ".config/hypr"; }
+      ];
+
+      # "*" is identical to [] as base
+      r2 = orc.mergeHomeFiles allFiles [
+        { include    = [ "*" ];
+          exclude    = [ "*.png" ];
+          emitter    = "symlink";
+          destPrefix = ".config/hypr"; }
+        { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+          emitter    = "copy";
+          destPrefix = ".config/hypr"; }
+      ];
+    in {
+      # wallust file → copy (force = true)
+      wallustIsCopy    = (r."${wallustKey}" or { }).force or false;
+      wallustHasSource = (r."${wallustKey}" or { }) ? source;
+      # everything else → symlink (no force)
+      sysIsSymlink     = (r."${sysKey}" or { }) ? source;
+      sysNoForce       = ! ((r."${sysKey}" or { }).force or false);
+      # include=[] ≡ include=["*"]
+      baseLayersEquiv  = r == r2;
+    };
+
+  # Scenario C: exclude hyprland.conf (managed by wayland.windowManager.hyprland)
+  # When home-manager's hyprland module manages hyprland.conf, exclude it
+  # from mergeHomeFiles to avoid the "Conflicting managed target files" error.
+  t_mergeHomeFiles_excludeConflict =
+    let
+      r = orc.mergeHomeFiles allFiles [
+        { include    = [ ];
+          exclude    = [ "hyprland.conf" "*.png" ];
+          emitter    = "symlink";
+          destPrefix = ".config/hypr"; }
+      ];
+    in {
+      noHyprlandConf = ! (r ? ".config/hypr/hyprland.conf");
+      hasSysFiles    = lib.any (lib.hasPrefix ".config/hypr/sys/") (builtins.attrNames r);
+    };
+
   # ─────────────────────────────────────────────────────────────────────────
-  # Layer 3e · emit (multi-emitter dispatch)
+  # Layer 3d · emit (multi-emitter dispatch)
   # ─────────────────────────────────────────────────────────────────────────
 
   t_emit_homeOnly =
     let
-      files  = orc.applyPolicy { include = [ "sys/" ]; emitter = "homeFiles"; } allFiles;
-      r      = orc.emit { inherit files pkgs; destPrefix = ".config/hypr"; drvName = "e-home"; };
+      files = orc.applyPolicy { include = [ "sys/" ]; emitter = "homeFiles"; } allFiles;
+      r     = orc.emit { inherit files pkgs; destPrefix = ".config/hypr"; drvName = "e-home"; };
     in {
       hasHomeFiles  = r ? homeFiles;
       noDerivation  = ! (r ? derivation);
@@ -233,17 +309,13 @@ let
         (builtins.unsafeDiscardStringContext "${r.symlinkTree}");
     };
 
-  # Canonical mixed case: sys/→symlink, user/→homeFiles, one file→derivation+patch
   t_emit_mixed =
     let
       files = orc.applyPolicies [
-        { include = [ "sys/" ];
-          exclude = [ "sys/scripts/" "*.png" ];
+        { include = [ "sys/" ]; exclude = [ "sys/scripts/" "*.png" ];
           emitter = "symlinkTree"; }
-        { include = [ "user/" ];
-          emitter = "homeFiles"; }
-        { include   = [ "hyprland.conf" ];
-          emitter   = "derivation";
+        { include = [ "user/" ]; emitter = "homeFiles"; }
+        { include   = [ "hyprland.conf" ]; emitter = "derivation";
           transform = _: entry: entry // { text = "# patched\n"; }; }
       ] allFiles;
       r = orc.emit {
@@ -256,8 +328,7 @@ let
       hasDerivation  = r ? derivation;
       hasSymlinkTree = r ? symlinkTree;
       homePrefix     = lib.all
-        (lib.hasPrefix ".config/hypr/")
-        (builtins.attrNames r.homeFiles);
+        (lib.hasPrefix ".config/hypr/") (builtins.attrNames r.homeFiles);
       derivIsDrv     = builtins.isString
         (builtins.unsafeDiscardStringContext "${r.derivation}");
       symlinkIsDrv   = builtins.isString
@@ -266,7 +337,6 @@ let
 
   # ─────────────────────────────────────────────────────────────────────────
   # High-level · readConfigDir
-  # Returns emit's result attrset — NOT a bare derivation
   # ─────────────────────────────────────────────────────────────────────────
 
   t_readConfigDir_homeFiles =
@@ -339,28 +409,32 @@ let
 
   allTests = {
     layer1 = {
-      readDirFlat        = t_readDirFlat;
-      listFilesRecursive = t_listFilesRecursive;
+      readDirFlat                = t_readDirFlat;
+      listFilesRecursive         = t_listFilesRecursive;
+      listFilesRecursiveFiltered = t_listFilesRecursiveFiltered;
     };
     layer2 = {
-      matchesPattern        = t_matchesPattern;
-      applyPolicy_include   = t_applyPolicy_include;
-      applyPolicy_exclude   = t_applyPolicy_exclude;
-      applyPolicy_transform = t_applyPolicy_transform;
-      applyPolicy_dropNull  = t_applyPolicy_dropNull;
-      applyPolicy_emitter   = t_applyPolicy_emitter;
+      matchesPattern         = t_matchesPattern;
+      applyPolicy_include    = t_applyPolicy_include;
+      applyPolicy_exclude    = t_applyPolicy_exclude;
+      applyPolicy_transform  = t_applyPolicy_transform;
+      applyPolicy_dropNull   = t_applyPolicy_dropNull;
+      applyPolicy_emitter    = t_applyPolicy_emitter;
       applyPolicies_lastWins = t_applyPolicies_lastWins;
     };
     layer3 = {
-      toHomeFiles_source  = t_toHomeFiles_source;
-      toHomeFiles_text    = t_toHomeFiles_text;
-      toDerivation        = t_toDerivation;
-      toSymlinkTree       = t_toSymlinkTree;
-      mergeHomeFiles      = t_mergeHomeFiles;
-      emit_homeOnly       = t_emit_homeOnly;
-      emit_derivationOnly = t_emit_derivationOnly;
-      emit_symlinkOnly    = t_emit_symlinkOnly;
-      emit_mixed          = t_emit_mixed;
+      toHomeFiles_source      = t_toHomeFiles_source;
+      toHomeFiles_text        = t_toHomeFiles_text;
+      toHomeFiles_force       = t_toHomeFiles_force;
+      toDerivation            = t_toDerivation;
+      toSymlinkTree           = t_toSymlinkTree;
+      mergeHomeFiles_explicit = t_mergeHomeFiles_explicit;
+      mergeHomeFiles_baseLayer    = t_mergeHomeFiles_baseLayer;
+      mergeHomeFiles_excludeConflict = t_mergeHomeFiles_excludeConflict;
+      emit_homeOnly           = t_emit_homeOnly;
+      emit_derivationOnly     = t_emit_derivationOnly;
+      emit_symlinkOnly        = t_emit_symlinkOnly;
+      emit_mixed              = t_emit_mixed;
     };
     highLevel = {
       homeFiles   = t_readConfigDir_homeFiles;
