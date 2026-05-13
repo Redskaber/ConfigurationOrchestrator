@@ -1,13 +1,14 @@
 # ConfigurationOrchestrator — tests/flake.nix
 #
 # Run the test suite:
-#   cd test
+#   cd tests
 #   nix eval .#_summary
 #   nix eval . --json | jq .layer3
+#   nix eval . --json | jq ._summary
+#   nix eval . --json | jq ._failedTests
 #
 # path:.. resolves to the parent directory (the library itself).
 # Local changes to lib/ take effect immediately without a GitHub push.
-# Run `nix flake update` only to pin a specific remote revision.
 {
   description = "ConfigurationOrchestrator — test suite";
 

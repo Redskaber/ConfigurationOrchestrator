@@ -4,10 +4,11 @@ A pure-Nix library for reading, filtering, transforming, and emitting
 configuration directory trees with **per-file emitter control**.
 
 ```
-lib/default.nix    — pure function library (three layers)
-tests/default.nix  — test suite
-tests/flake.nix    — test harness (hypr-config fixture lives here only)
+lib/default.nix    — pure function library (three layers + high-level API)
+tests/default.nix  — test suite (120+ assertions)
+tests/flake.nix    — test harness (hypr-config fixture)
 flake.nix          — public interface: lib.<system>
+docs/              — architecture, API reference, recipes, extension guide
 ```
 
 ---
@@ -23,6 +24,40 @@ whole tree**. You often need finer control:
 | One file written by a tool at runtime  | `mergeHomeFiles` `"copy"` emitter              |
 | Mix of stable files + runtime-writable | `xdg.configFile` + `mergeHomeFiles` activation |
 | Per-file emitter dispatch at scale     | `emit` / `readConfigDir`                       |
+| Custom installation strategy           | `registerEmitter` (plugin point)               |
+
+---
+
+## Architecture overview
+
+```
+src (Nix path)
+  │
+  ▼  Layer 1 · Discovery
+  │  listFilesRecursive / listFilesRecursiveFiltered / readDirFlat
+  │  FileMap :: { "rel/path" = { absPath; type; }; }
+  │
+  ▼  Layer 2 · Policy Engine
+  │  applyPolicy / applyPolicies / tagAll
+  │  Tags each file with { emitter; priority; ?text; ?force; }
+  │  Last-match-wins composition. tagAll = zero-policy fast path.
+  │  TaggedMap :: { "rel/path" = { absPath; type; emitter; priority; … }; }
+  │
+  ▼  Layer 3 · Emitter Dispatch
+  │  ┌──────────────────────────────────────────────────────────────────┐
+  │  │  emit / readConfigDir                                            │
+  │  │                                                                  │
+  │  │  "homeFiles"    "derivation"    "symlinkTree"   <custom>         │
+  │  │  home.file      physical copy   symlink tree    registerEmitter  │
+  │  └──────────────────────────────────────────────────────────────────┘
+  │  Returns: EmitResult :: { homeFiles; ?derivation; ?symlinkTree; … }
+  │
+  │  ── mergeHomeFiles ──────────────────────────────────────────────────
+  │  Returns: MergeResult :: { homeFiles; activation }
+  │    "symlink"  → homeFiles   { source = absPath; }   read-only symlink
+  │    "copy"     → activation  run cp absPath $HOME/key  real writable file
+  │    "text"     → homeFiles   { text = entry.text; }  symlink to store file
+```
 
 ---
 
@@ -30,11 +65,9 @@ whole tree**. You often need finer control:
 
 ### home.file and xdg.configFile always use symlinks
 
-Both `home.file` and `xdg.configFile` in home-manager **always install as
-symlinks** into the read-only Nix store — regardless of `force`, `text`, or
-`source`. This is the core constraint that drives this library's design.
-
-Relevant options from home-manager:
+Both options **always install as symlinks** into the read-only Nix store,
+regardless of `force`, `text`, or `source`. This is the core constraint that
+drives this library's design.
 
 | Option                        | Purpose                                                          |
 | ----------------------------- | ---------------------------------------------------------------- |
@@ -46,28 +79,17 @@ Relevant options from home-manager:
 | `home.file.<name>.executable` | Set the execute bit on the linked file                           |
 | `xdg.configFile.<name>.*`     | Same options, but paths are relative to `$XDG_CONFIG_HOME`       |
 
-The **only** way to produce a real writable file is via `home.activation`,
-which runs shell commands after the linking phase. The `"copy"` emitter in
-`mergeHomeFiles` generates an activation script that `cp`s the file using
-the `run` helper (respects `DRY_RUN` and `VERBOSE`).
+The **only** way to produce a real writable file is via `home.activation`.
+The `"copy"` emitter in `mergeHomeFiles` generates an activation script that
+`cp`s the file using the `run` helper (respects `DRY_RUN` and `VERBOSE`).
 
 ### home.activation
 
-`home.activation` entries are DAG nodes that run after linking. Each entry
-must be idempotent and must respect:
+Entries are DAG nodes that run after linking. Each entry must:
 
-- `DRY_RUN` — if set, log but don't perform actions
-- `VERBOSE` / `VERBOSE_ARG` — if set, print debug information
-
-The library uses the `run` helper in generated activation scripts:
-
-```sh
-run mkdir -p "$(dirname "$HOME/key")"
-run cp --remove-destination /nix/store/... "$HOME/key"
-run chmod u+w "$HOME/key"
-```
-
-Your module must place the activation script after `writeBoundary`:
+- Be idempotent
+- Respect `DRY_RUN` — if set, log but don't perform actions
+- Respect `VERBOSE` / `VERBOSE_ARG` — if set, print debug information
 
 ```nix
 home.activation.myScript =
@@ -76,215 +98,28 @@ home.activation.myScript =
 
 ---
 
-## Architecture
+## Lifecycle (state machine)
 
 ```
-src (path)
-  │
-  ▼  Layer 1 · Discovery
-  │  listFilesRecursive / listFilesRecursiveFiltered / readDirFlat
-  │  { "rel/path" = { absPath; type; }; ... }
-  │
-  ▼  Layer 2 · Policy Engine
-  │  applyPolicy / applyPolicies / tagAll
-  │  Each policy tags matching files with { emitter; priority; ?text; ... }
-  │  tagAll stamps every file with the default emitter when no policies exist.
-  │  Policies compose: LAST match wins per file.
-  │  { "rel/path" = { absPath; type; emitter; priority; ?text; }; ... }
-  │
-  ▼  Layer 3 · Emitter Dispatch
-     ┌──────────────────────────────────────────────────────────────┐
-     │  emit / readConfigDir                                        │
-     │                                                              │
-     │  "homeFiles"    "derivation"    "symlinkTree"                │
-     │  home.file      physical copy   symlink tree                 │
-     │  attrset        store path      store path                   │
-     └──────────────────────────────────────────────────────────────┘
-     Returns: { homeFiles; ?derivation; ?symlinkTree; }
+[EVAL]       Nix evaluation:
+               Discovery (L1) → Policy (L2) → Emit (L3) → EmitResult/MergeResult
 
-     ─── mergeHomeFiles ─────────────────────────────────────────────
-     Returns: { homeFiles; activation }
-       "symlink"  → homeFiles   { source = absPath; }   read-only symlink
-       "copy"     → activation  run cp absPath $HOME/key  real writable file
-       "text"     → homeFiles   { text = entry.text; }  symlink to generated file
-```
+[LINK]       home-manager switch — writeBoundary:
+               checkLinkTargets → home.file symlinks placed
 
-### TaggedMap invariant
+[ACTIVATE]   home-manager switch — post-writeBoundary:
+               activation scripts execute:
+                 run mkdir -p …
+                 run cp --remove-destination …   ← "copy" emitter
+                 run chmod u+w …
 
-**`emit` and `toHomeFiles` require a TaggedMap** — every entry must have
-`emitter` and `priority` attributes. This is the contract between Layer 2 and
-Layer 3. Use one of:
-
-- `applyPolicy policy files` — tag files matched by a single policy
-- `applyPolicies policies files` — fold multiple policies (last-wins)
-- `tagAll files` — stamp all files with the default emitter (`"homeFiles"`, priority 5)
-
-`readConfigDir` enforces this invariant internally: when `policies = []` it
-calls `tagAll` before handing files to `emit`.
-
-**Core design principle:** the emitter is a property of each file, set by its
-policy — not a global switch for the whole tree.
-
-### Design principles
-
-| Principle            | How it manifests                                             |
-| -------------------- | ------------------------------------------------------------ |
-| Dependency inversion | Callers depend on policy abstractions, not filesystem layout |
-| Pipeline / dataflow  | Discovery → Policy → Emit; each stage is a pure function     |
-| Layered architecture | Each layer exposes a stable, composable interface            |
-| Data-driven          | Behaviour driven by policy attrsets, not hard-coded logic    |
-| Open/closed          | Extend via new policies and transforms, not source edits     |
-| Explicit boundaries  | home.file symlinks vs. activation `cp` are kept distinct     |
-| Incremental          | Policies compose; last-match-wins enables override idiom     |
-
----
-
-## Common pitfall: conflicting managed target files
-
-```
-error: Failed assertions:
-- Conflicting managed target files: .config/hypr/hyprland.conf
-```
-
-Two modules are declaring the same destination file. Diagnose with:
-
-```bash
-nix eval .#homeConfigurations."user@host".config.home.file --json \
-  | jq 'to_entries | map(select(.key | contains("hyprland.conf"))) | .'
-```
-
-**Cause A — `wayland.windowManager.hyprland` generates `hyprland.conf`**
-
-When the hyprland module has `settings`, `extraConfig`, or plugins configured,
-it generates `.config/hypr/hyprland.conf`. Any other module also writing that
-path causes a conflict.
-
-The correct fix is to use `xdg.configFile` with `force = true`, which tells
-home-manager to let your file win over the module-generated one:
-
-```nix
-xdg.configFile."hypr" = {
-  source    = inputs.hypr-config;
-  recursive = true;
-  force     = true;   # your hyprland.conf wins over the module-generated one
-};
-```
-
-**Cause B — `listFilesRecursive` sees both a symlink and its target**
-
-`hypr-config` root may contain alias symlinks like
-`hypridle.conf → sys/hypridle.conf`. Using `listFilesRecursive` picks up both
-the root-level symlink and the real file under `sys/`, potentially generating
-two `home.file` entries that collide. Use `listFilesRecursiveFiltered` to skip
-symlinks at discovery time:
-
-```nix
-files = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
+[RUNTIME]    External tools write into the copied (writable) files:
+               wallust, pywal, etc.
 ```
 
 ---
 
-## Layer 1 — File Discovery
-
-```nix
-# Non-recursive: { "name" = "regular"|"directory"|"symlink"|"unknown"; }
-readDirFlat dir
-
-# Recursive — includes ALL non-directory entries (regular, symlink, …)
-listFilesRecursive dir ""
-
-# Recursive — skips entries whose type is in skipTypes at discovery time
-listFilesRecursiveFiltered dir "" [ "symlink" ]
-```
-
----
-
-## Layer 2 — Policy
-
-A **policy** is an attrset — all fields optional:
-
-```nix
-{
-  include   = [ "sys/" "*.conf" ];    # [] = accept everything (same as ["*"])
-  exclude   = [ "*.png" ];            # [] = drop nothing
-  transform = relPath: entry:         # return null to drop the file
-    entry // { text = "# header\n" + builtins.readFile entry.absPath; };
-  emitter   = "homeFiles";            # "homeFiles" | "derivation" | "symlinkTree"
-  priority  = 5;                      # home-manager mkMerge priority
-}
-```
-
-`applyPolicies` processes the list in order. **Last match wins** per file:
-
-```nix
-applyPolicies [
-  { include = [ "sys/" ]; emitter = "symlinkTree"; }            # broad base
-  { include = [ "sys/startup.conf" ]; emitter = "derivation"; } # override
-] allFiles
-```
-
-`tagAll` stamps all files with the default emitter without filtering:
-
-```nix
-# Equivalent to applyPolicies [{ include = []; emitter = "homeFiles"; }] files
-# but cheaper — no pattern matching, no filter pass.
-tagAll files
-```
-
-**Pattern syntax:**
-
-| Pattern           | Semantics                                          |
-| ----------------- | -------------------------------------------------- |
-| `[]` or `[ "*" ]` | accept everything                                  |
-| `"sys/"`          | prefix match                                       |
-| `"*.conf"`        | suffix match                                       |
-| `"sys/*"`         | prefix match (trailing `*` stripped)               |
-| `"/ERE/"`         | POSIX extended regular expression (builtins.match) |
-
----
-
-## Layer 3 — Emitters
-
-### Low-level helpers
-
-```nix
-toHomeFiles   destPrefix files          # → home.file attrset (symlinks)
-toDerivation  { pkgs, name, files }     # → store path (physical copy)
-toSymlinkTree { pkgs, name, files }     # → store path (symlink tree)
-```
-
-### `emit` — multi-emitter dispatch
-
-```nix
-emit { files; destPrefix?; pkgs?; drvName?; }
-→ { homeFiles; ?derivation; ?symlinkTree; }
-```
-
-### `mergeHomeFiles` — returns `{ homeFiles; activation; }`
-
-```nix
-mergeHomeFiles files policies
-→ { homeFiles  :: attrset;   # → home.file = result.homeFiles
-    activation :: string;    # → home.activation.<n> =
-                             #     lib.hm.dag.entryAfter ["writeBoundary"]
-                             #       result.activation
-  }
-```
-
-| `emitter`   | destination  | result                                                    |
-| ----------- | ------------ | --------------------------------------------------------- |
-| `"symlink"` | `homeFiles`  | read-only symlink into Nix store                          |
-| `"copy"`    | `activation` | **real writable file** — `run cp` on every activation     |
-| `"text"`    | `homeFiles`  | symlink to store-generated text file (requires transform) |
-
-**copy eviction rule:** if a `"copy"` policy matches a key that was already
-placed in `homeFiles` by a prior `"symlink"` policy, the key is evicted from
-`homeFiles` and moved exclusively to the activation script. This ensures no
-conflict between home.file and activation.
-
----
-
-## Usage
+## Quick start
 
 ### Add as a flake input
 
@@ -299,69 +134,105 @@ orc = inputs.configuration-orchestrator.lib.${pkgs.system};
 
 ---
 
-### home-manager examples
+## home-manager examples
 
-#### 1 — xdg.configFile + activation (recommended for hyprland)
+### 1 — Everything as symlinks (simplest)
 
 ```nix
-{ inputs, shared, lib, ... }:
-let
-  hyprResult = shared.orc.mergeHomeFiles (
-    shared.orc.listFilesRecursive inputs.hypr-config ""
-  ) [
-    { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
-      emitter    = "copy";
-      destPrefix = ".config/hypr"; }
-  ];
-in
-{
-  xdg.configFile."hypr" = {
-    source    = inputs.hypr-config;
-    recursive = true;
-    force     = true;
-  };
-
-  home.activation.hyprWallust =
-    lib.hm.dag.entryAfter [ "writeBoundary" ] hyprResult.activation;
-}
+# policies = [] → tagAll internally → all files become homeFiles
+home.file = (orc.readConfigDir {
+  src        = inputs.my-config;
+  recursive  = true;
+  destPrefix = ".config/myapp";
+}).homeFiles;
 ```
 
-#### 2 — mergeHomeFiles only (no xdg.configFile conflict)
+### 2 — One writable file, everything else symlinked
 
 ```nix
-{ inputs, pkgs, lib, ... }:
 let
-  orc    = inputs.configuration-orchestrator.lib.${pkgs.system};
-  files  = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
-  result = orc.mergeHomeFiles files [
-    { include    = [ ];
-      exclude    = [ "*.png" ];
-      emitter    = "symlink";
-      destPrefix = ".config/hypr"; }
-    { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
-      emitter    = "copy";
-      destPrefix = ".config/hypr"; }
-  ];
-in
-{
+  result = orc.mergeHomeFiles
+    (orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ])
+    [
+      { include    = [ ];
+        emitter    = "symlink";
+        destPrefix = ".config/hypr"; }
+      { include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+        emitter    = "copy";
+        destPrefix = ".config/hypr"; }
+    ];
+in {
   home.file = result.homeFiles;
   home.activation.hyprWallust =
     lib.hm.dag.entryAfter [ "writeBoundary" ] result.activation;
 }
 ```
 
-#### 3 — simple: everything as home.file (no policies needed)
+### 3 — Conflict with a home-manager module (hyprland)
+
+When `wayland.windowManager.hyprland` generates `hyprland.conf` and conflicts
+with your config tree:
 
 ```nix
-# policies = [] → tagAll → all files become homeFiles entries automatically
-home.file = (orc.readConfigDir {
-  src        = inputs.hypr-config;
-  recursive  = true;
-  destPrefix = ".config/hypr";
-}).homeFiles;
+{
+  xdg.configFile."hypr" = {
+    source    = inputs.hypr-config;
+    recursive = true;
+    force     = true;   # your file wins over module-generated one
+  };
+
+  home.activation.hyprWallust =
+    lib.hm.dag.entryAfter [ "writeBoundary" ]
+      (orc.mergeHomeFiles
+        (orc.listFilesRecursive inputs.hypr-config "")
+        [{ include    = [ "sys/policy/wallust/wallust-hyprland.conf" ];
+           emitter    = "copy";
+           destPrefix = ".config/hypr"; }]
+      ).activation;
+}
 ```
 
-#### 4 — symlink tree + home.file (large stable trees)
+### 4 — force flag per policy
+
+```nix
+let
+  result = orc.mergeHomeFiles
+    (orc.listFilesRecursiveFiltered inputs.my-config "" [ "symlink" ])
+    [{
+      include    = [ "*.conf" ];
+      emitter    = "symlink";
+      destPrefix = ".config/myapp";
+      force      = true;   # unconditionally replace targets
+    }];
+in { home.file = result.homeFiles; }
+```
+
+### 5 — Custom emitter via registerEmitter
+
+```nix
+let
+  # Register a custom emitter that builds a JSON index of all managed files
+  indexEmitters = orc.registerEmitter orc.defaultEmitters "jsonIndex"
+    ({ files, pkgs, drvName, ... }:
+      pkgs.writeText "${drvName}-index.json"
+        (builtins.toJSON (builtins.attrNames files)));
+
+  result = orc.readConfigDir {
+    src      = inputs.my-config;
+    inherit pkgs;
+    emitters = indexEmitters;
+    policies = [
+      { include = [ "sys/" ]; emitter = "homeFiles"; }
+      { include = [ "sys/" ]; emitter = "jsonIndex"; }
+    ];
+  };
+in {
+  home.file                    = result.homeFiles;
+  home.file.".config/index.json".source = result.jsonIndex;
+}
+```
+
+### 6 — symlink tree + home.file (large stable trees)
 
 ```nix
 let result = orc.readConfigDir {
@@ -381,26 +252,21 @@ let result = orc.readConfigDir {
 }
 ```
 
-#### 5 — mergeHomeFiles: symlink + copy + text
+### 7 — mergeHomeFiles: symlink + copy + text
 
 ```nix
-{ inputs, pkgs, lib, ... }:
 let
-  orc    = inputs.configuration-orchestrator.lib.${pkgs.system};
-  files  = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
-  result = orc.mergeHomeFiles files [
-    { include = [ ]; exclude = [ "*.png" ]; emitter = "symlink";
-      destPrefix = ".config/hypr"; }
-    { include = [ "sys/hardware/" ]; emitter = "copy";
-      destPrefix = ".config/hypr"; }
-    { include = [ "sys/policy/wallust/wallust-hyprland.conf" ]; emitter = "copy";
-      destPrefix = ".config/hypr"; }
-    { include = [ "user/startup.conf" ]; emitter = "text";
-      transform = _: e: e // {
-        text = "# managed by Nix\n" + builtins.readFile e.absPath;
-      };
-      destPrefix = ".config/hypr"; }
-  ];
+  result = orc.mergeHomeFiles
+    (orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ])
+    [
+      { include = [ ]; exclude = [ "*.png" ]; emitter = "symlink";
+        destPrefix = ".config/hypr"; }
+      { include = [ "sys/hardware/" ]; emitter = "copy";
+        destPrefix = ".config/hypr"; }
+      { include = [ "user/startup.conf" ]; emitter = "text";
+        transform = _: e: e // { text = "# managed by Nix\n" + builtins.readFile e.absPath; };
+        destPrefix = ".config/hypr"; }
+    ];
 in
 {
   home.file = result.homeFiles;
@@ -411,9 +277,9 @@ in
 
 ---
 
-### NixOS examples
+## NixOS examples
 
-#### 6 — expose sys/ via environment.etc
+### 8 — expose sys/ via environment.etc
 
 ```nix
 { pkgs, inputs, ... }:
@@ -427,12 +293,10 @@ let
 in { environment.etc."hypr/sys".source = result.symlinkTree; }
 ```
 
-#### 7 — NixOS + home-manager together
+### 9 — NixOS + home-manager together
 
 ```nix
-{ pkgs, inputs, ... }:
 let
-  orc    = inputs.configuration-orchestrator.lib.${pkgs.system};
   result = orc.readConfigDir {
     src = inputs.hypr-config; inherit pkgs;
     recursive = true; destPrefix = ".config/hypr"; name = "hypr-config";
@@ -450,171 +314,94 @@ in
 
 ---
 
-## Transform recipes
+## TaggedMap invariant
 
-**Prepend a header:**
+**`emit` and `toHomeFiles` require a TaggedMap** — every entry must have
+`emitter` and `priority` attributes.
 
-```nix
-transform = relPath: entry:
-  if lib.hasSuffix ".conf" relPath
-  then entry // { text = "# managed by Nix\n" + builtins.readFile entry.absPath; }
-  else entry;
-```
+| Function        | When to use                                           |
+| --------------- | ----------------------------------------------------- |
+| `applyPolicy`   | Apply a single policy (filters + tags matching files) |
+| `applyPolicies` | Apply a list of policies (last-wins per file)         |
+| `tagAll`        | Tag all files with defaults (no filtering)            |
 
-**Drop a specific file:**
-
-```nix
-transform = relPath: entry:
-  if relPath == "sys/secret.conf" then null else entry;
-```
-
-**Drop source-tree symlinks:**
-
-```nix
-# At discovery time (preferred — prevents duplicate home.file entries):
-files = orc.listFilesRecursiveFiltered src "" [ "symlink" ];
-
-# Or via transform (post-hoc):
-transform = _: e: if e.type == "symlink" then null else e;
-```
+Never pass a raw `FileMap` directly to `emit` or `toHomeFiles`.
 
 ---
 
-## Tests
-
-```bash
-cd tests
-nix eval .#_summary
-# { allPassed = true; passed = N; total = N; }
-
-nix eval . --json | jq .layer3
-nix eval . --json | jq ._summary
-```
-
-All 4 test groups must pass:
+## Common pitfall: conflicting managed target files
 
 ```
-layer1    — File Discovery
-layer2    — Policy Engine
-layer3    — Emitter Dispatch
-highLevel — readConfigDir (including noPolicies path)
+error: Failed assertions:
+- Conflicting managed target files: .config/hypr/hyprland.conf
 ```
 
----
+**Cause A** — `wayland.windowManager.hyprland` generates `hyprland.conf`.
+Fix: use `xdg.configFile` with `force = true` (see example 3 above).
 
-## API reference
+**Cause B** — `listFilesRecursive` sees both a symlink and its target.
+Fix: use `listFilesRecursiveFiltered` to skip symlinks at discovery time:
 
-### `readConfigDir`
-
-```
-readConfigDir {
-  src        :: path
-  recursive  :: bool          (default: true)
-  policies   :: [ policy ]    When [] all files pass through as "homeFiles"
-  destPrefix :: string        (default: "")
-  pkgs       :: pkgs          required for derivation / symlinkTree
-  name       :: string        (default: "config-tree")
-}
-→ { homeFiles; ?derivation; ?symlinkTree; }
-```
-
-### `mergeHomeFiles`
-
-```
-mergeHomeFiles files [ homePolicy ]
-→ { homeFiles :: attrset; activation :: string; }
-
-homePolicy fields (all optional):
-  include    :: [ pattern ]
-  exclude    :: [ pattern ]
-  transform  :: relPath → entry → entry | null
-  emitter    :: "symlink" | "copy" | "text"   (default: "symlink")
-  destPrefix :: string                         (default: "")
-  priority   :: int                            (default: 5)
-
-emitter destinations:
-  "symlink"  → homeFiles   { source = absPath; }
-  "copy"     → activation  run cp --remove-destination absPath $HOME/key
-  "text"     → homeFiles   { text = entry.text; }   (requires transform)
-
-eviction: a "copy" policy evicts the same key from homeFiles
-          (even if placed there by a prior "symlink" policy).
-```
-
-### `emit`
-
-```
-emit { files; destPrefix?; pkgs?; drvName?; }
-→ { homeFiles; ?derivation; ?symlinkTree; }
-
-Precondition: every entry in `files` must have `emitter` and `priority`.
-Use tagAll, applyPolicy, or applyPolicies before calling emit directly.
-```
-
-### `tagAll`
-
-```
-tagAll :: FileMap → TaggedMap
-
-Stamps every entry with emitter = "homeFiles" and priority = 5.
-Use when you want all files as home.file entries without any filtering.
-Equivalent to applyPolicies [{ include = []; emitter = "homeFiles"; }] files
-but without the pattern-matching overhead.
-```
-
-### Low-level exports
-
-```
-readDirFlat                  :: path → { name = type; }
-listFilesRecursive           :: path → string → FileMap
-listFilesRecursiveFiltered   :: path → string → [ type ] → FileMap
-matchesPattern               :: relPath → pattern → bool
-matchesAny                   :: relPath → [ pattern ] → bool
-applyPolicy                  :: policy → files → TaggedMap
-applyPolicies                :: [ policy ] → files → TaggedMap
-tagAll                       :: FileMap → TaggedMap
-toHomeFiles                  :: destPrefix → TaggedMap → HomeFiles
-toDerivation                 :: { pkgs; name; files } → derivation
-toSymlinkTree                :: { pkgs; name; files } → derivation
-emit                         :: { files; destPrefix; pkgs; drvName } → EmitResult
-mergeHomeFiles               :: FileMap → [ homePolicy ] → MergeResult
-readConfigDir                :: { src; recursive; policies; destPrefix; pkgs; name } → EmitResult
+```nix
+files = orc.listFilesRecursiveFiltered inputs.hypr-config "" [ "symlink" ];
 ```
 
 ---
 
 ## Changelog
 
-### v3 (current)
+### v4 (current)
+
+- **Fix:** `priority` field is now correctly propagated via `lib.mkOrder`
+  in `toHomeFiles` and `mergeHomeFiles` when it differs from the default (5).
+  Previously it was stored in the TaggedMap but never applied to the
+  resulting home.file entries. This was the most significant correctness gap.
+- **New:** `force` field in `HomePolicy` (for `mergeHomeFiles`). Both
+  `"symlink"` and `"text"` emitters now propagate `force = true` to the
+  generated home.file entry. `"copy"` entries are always written (unaffected).
+- **New:** `registerEmitter` — open/closed plugin point for custom emitters.
+  Callers can add new emitter types without modifying the library source.
+- **New:** `emit` and `readConfigDir` accept an `emitters` argument for
+  dependency injection of the emitter registry.
+- **New:** `defaultEmitters` exported so callers can build on the built-in set.
+- **New:** `defaultPolicy` exported for introspection and documentation.
+- **New:** `_failedTests` output in the test suite for easier debugging.
+- **Fix:** `orchError` helper produces friendlier, location-tagged error messages
+  with actionable hints for `emitter="text"` missing transform.
+- **Fix:** `toDerivation` shell quoting for `escapedRel` used consistently.
+- **Docs:** Architecture, API, recipes fully updated for v4 features.
+
+### v3
 
 - **Fix:** `readConfigDir` with `policies = []` now correctly passes a
-  `TaggedMap` to `emit` instead of a raw `FileMap`. Previously, untagged
-  entries caused `«error: attribute 'emitter' missing»` in `emit`'s
-  `filterAttrs` call. The fix introduces `tagAll`, a lightweight helper that
-  stamps all entries with the default emitter (`"homeFiles"`) and priority (5)
-  without running the policy engine.
-- **New:** `tagAll` exported as a first-class Layer-2 function. Useful when
-  callers want all files as `homeFiles` entries without any filtering.
-- **Docs:** `TaggedMap` invariant made explicit in `emit`'s contract comment,
-  in the architecture section, and in the API reference.
-- **Tests:** `t_readConfigDir_noPolicies` now passes (was
-  `«error: attribute 'emitter' missing»` in v2).
+  `TaggedMap` to `emit` via `tagAll`.
+- **New:** `tagAll` exported as a first-class Layer-2 function.
+- **Docs:** `TaggedMap` invariant made explicit throughout.
 
 ### v2
 
-- **Fix:** `listFilesRecursiveFiltered` now correctly propagates `skipTypes`
-  into recursive directory calls (previously only filtered the top level).
-- **Fix:** `mergeHomeFiles` activation script uses `run` helper (respects
-  `DRY_RUN` / `VERBOSE` as required by `home.activation`).
-- **Fix:** `mergeHomeFiles` iteration order is now deterministic (sorted keys)
-  for stable activation script generation.
-- **New:** `toHomeFiles` propagates `entry.force = true` to home.file entries.
-- **New:** `mergeHomeFiles` `"copy"` emitter evicts the same key from
-  `homeFiles` even if a prior policy placed it there.
-- **New:** `readConfigDir` non-recursive mode (`recursive = false`) now works.
-- **New:** `emit` asserts `pkgs != null` when `derivation` or `symlinkTree`
-  emitters are used, with a clear error message.
-- **New:** Multi-system support in root `flake.nix`
-  (`x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`).
-- **Tests:** Added `noSymlinksDeep`, `toHomeFiles_force`,
-  `mergeHomeFiles_copyEvictsSymlink`, `readConfigDir_noPolicies`.
+- **Fix:** `listFilesRecursiveFiltered` propagates `skipTypes` recursively.
+- **Fix:** `mergeHomeFiles` activation script uses `run` helper.
+- **Fix:** Deterministic key ordering in `mergeHomeFiles`.
+- **New:** `toHomeFiles` propagates `force = true`.
+- **New:** `mergeHomeFiles` `"copy"` eviction rule.
+- **New:** `readConfigDir` non-recursive mode.
+- **New:** Multi-system support in `flake.nix`.
+
+---
+
+## Running tests
+
+```bash
+cd tests
+nix eval .#_summary
+# { allPassed = true; passed = N; total = N; }
+
+nix eval . --json | jq ._failedTests
+# []  (empty when all pass)
+
+nix eval . --json | jq .layer3
+nix eval . --json | jq .v4
+```
+
+All 5 test groups must pass: `layer1`, `layer2`, `layer3`, `highLevel`, `v4`.

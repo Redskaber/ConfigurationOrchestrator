@@ -15,7 +15,7 @@ home.file = (orc.readConfigDir {
 }).homeFiles;
 ```
 
-Or explicitly with `tagAll` if you want to call `emit` yourself:
+Or explicitly with `tagAll`:
 
 ```nix
 let
@@ -26,10 +26,11 @@ in
 { home.file = result.homeFiles; }
 ```
 
+---
+
 ### Pattern 2 — One writable file, everything else symlinked
 
-Best for tools like wallust, pywal, or any tool that writes a single config
-file at runtime.
+Best for tools like wallust, pywal that write a single config file at runtime.
 
 ```nix
 let
@@ -50,16 +51,16 @@ in {
 }
 ```
 
-### Pattern 3 — Conflict with a home-manager module
+---
+
+### Pattern 3 — Conflict with a home-manager module (hyprland)
 
 When a module (e.g. `wayland.windowManager.hyprland`) generates a file
-that conflicts with your config tree, use `xdg.configFile` with `force = true`
-to win the conflict, and `mergeHomeFiles` only for the files that need to be
-writable.
+that conflicts with your config tree:
 
 ```nix
 {
-  # The whole tree via xdg.configFile — force=true wins conflicts
+  # Whole tree via xdg.configFile — force=true wins conflicts
   xdg.configFile."hypr" = {
     source    = inputs.hypr-config;
     recursive = true;
@@ -77,6 +78,8 @@ writable.
       ).activation;
 }
 ```
+
+---
 
 ### Pattern 4 — Adding a header comment to all .conf files
 
@@ -99,6 +102,8 @@ in {
 }
 ```
 
+---
+
 ### Pattern 5 — Exclude secrets from the managed tree
 
 ```nix
@@ -116,10 +121,12 @@ in {
 }
 ```
 
+---
+
 ### Pattern 6 — Large stable tree as a symlink tree (efficient)
 
-For very large trees, creating one symlink tree derivation is more efficient
-than generating hundreds of individual `home.file` entries.
+For very large trees, one derivation is more efficient than thousands of
+individual `home.file` entries.
 
 ```nix
 let
@@ -138,6 +145,8 @@ in {
   xdg.configFile."myapp/sys".source = result.symlinkTree;
 }
 ```
+
+---
 
 ### Pattern 7 — Multiple config trees composed
 
@@ -158,15 +167,13 @@ in {
 }
 ```
 
-### Pattern 8 — tagAll for direct emit without policies
+---
 
-When you want full control of the emit pipeline but have no filtering
-requirements, use `tagAll` to satisfy the `TaggedMap` contract:
+### Pattern 8 — tagAll for direct emit without policies
 
 ```nix
 let
   files  = orc.listFilesRecursiveFiltered inputs.my-config "" [ "symlink" ];
-  # tagAll stamps { emitter = "homeFiles"; priority = 5; } on every entry
   tagged = orc.tagAll files;
   result = orc.emit {
     files      = tagged;
@@ -177,8 +184,87 @@ in {
 }
 ```
 
-This is equivalent to `readConfigDir` with `policies = []` but lets you
-control the discovery step separately.
+---
+
+### Pattern 9 — force per policy
+
+When you need `force = true` on a subset of files (not the whole tree):
+
+```nix
+let
+  result = orc.mergeHomeFiles
+    (orc.listFilesRecursiveFiltered inputs.my-config "" [ "symlink" ])
+    [
+      # Most files: normal symlinks
+      { include    = [ ];
+        emitter    = "symlink";
+        destPrefix = ".config/myapp"; }
+      # This file: force=true because another module also writes it
+      { include    = [ "colors.conf" ];
+        emitter    = "symlink";
+        destPrefix = ".config/myapp";
+        force      = true; }
+    ];
+in {
+  home.file = result.homeFiles;
+}
+```
+
+---
+
+### Pattern 10 — Custom emitter via registerEmitter
+
+Build a JSON manifest of all managed files alongside the normal homeFiles:
+
+```nix
+let
+  manifestEmitters = orc.registerEmitter orc.defaultEmitters "manifest"
+    ({ files, pkgs, drvName, ... }:
+      pkgs.writeText "${drvName}-manifest.json"
+        (builtins.toJSON
+          (map (relPath: { path = relPath; absPath = files.${relPath}.absPath; })
+               (builtins.attrNames files))));
+
+  result = orc.readConfigDir {
+    src      = inputs.my-config;
+    inherit pkgs;
+    emitters = manifestEmitters;
+    policies = [
+      { include = [ "sys/" ]; emitter = "homeFiles"; }
+      { include = [ "sys/" ]; emitter = "manifest"; }
+    ];
+    destPrefix = ".config/myapp";
+  };
+in {
+  home.file = result.homeFiles // {
+    ".config/myapp/.manifest.json".source = result.manifest;
+  };
+}
+```
+
+---
+
+### Pattern 11 — Priority-based merge ordering
+
+When multiple home-manager modules write to overlapping paths, use `priority`
+to control which entry wins via `lib.mkOrder`:
+
+```nix
+let
+  result = orc.mergeHomeFiles files [
+    { include  = [ "base.conf" ];
+      emitter  = "symlink";
+      priority = 100;         # ← low priority; let other modules override
+      destPrefix = ".config/myapp"; }
+    { include  = [ "override.conf" ];
+      emitter  = "symlink";
+      priority = 1000;        # ← high priority; wins over other modules
+      destPrefix = ".config/myapp"; }
+  ];
+in {
+  home.file = result.homeFiles;
+}
+```
 
 ---
 
@@ -190,52 +276,51 @@ Extend `matchesPattern` in `lib/default.nix`:
 
 ```nix
 matchesPattern = relPath: pattern:
-  # ... existing cases ...
+  # … existing cases …
   else if lib.hasPrefix "~" pattern then
-    # custom case: case-insensitive match
     lib.toLower relPath == lib.toLower (lib.removePrefix "~" pattern)
   else
     lib.hasPrefix pattern relPath;
 ```
 
-### Adding a new emitter type to `emit`
+### Adding a new emitter type to emit (recommended)
+
+Use `registerEmitter` — no source modification needed:
 
 ```nix
-emit = { files, destPrefix ? "", pkgs ? null, drvName ? "config-tree" }:
-  let
-    # ... existing byEmitter calls ...
-    customEntries = byEmitter "myCustomEmitter";
+let
+  myEmitters = orc.registerEmitter orc.defaultEmitters "myType"
+    ({ files, destPrefix, pkgs, drvName }:
+      myBuilder files);
 
-    customOutput =
-      if customEntries == { } then null
-      else myCustomBuilder { inherit pkgs; files = customEntries; };
-  in
-  { inherit homeFiles; }
-  // lib.optionalAttrs (derivation    != null) { inherit derivation; }
-  // lib.optionalAttrs (symlinkTree   != null) { inherit symlinkTree; }
-  // lib.optionalAttrs (customOutput  != null) { myCustom = customOutput; };
+  result = orc.emit { inherit files pkgs; emitters = myEmitters; };
+in …
 ```
 
-### Adding a new emitter to `mergeHomeFiles`
+### Adding a new home emitter to mergeHomeFiles
 
-Add a new branch in the `finalResult` fold:
+Fork `mergeHomeFiles` and add a new branch in the `finalResult` fold.
+Example — a `"template"` emitter that substitutes `{{HOST}}`:
 
 ```nix
 else if d.emitter == "template" then
   acc // {
     homeFiles = acc.homeFiles // {
-      "${key}" = { text = lib.replaceStrings [ "{{HOST}}" ] [ config.networking.hostName ] d.text; };
+      "${key}" = {
+        text = lib.replaceStrings
+          [ "{{HOST}}" ]
+          [ config.networking.hostName ]
+          d.text;
+      };
     };
   }
 ```
 
-### Custom transform pipeline
-
-Transforms can be composed manually:
+### Custom transform pipeline (compose transforms)
 
 ```nix
 let
-  addHeader = _: e: e // { text = "# header\n" + builtins.readFile e.absPath; };
+  addHeader    = _: e: e // { text = "# header\n" + builtins.readFile e.absPath; };
   stripComments = _: e:
     e // { text = lib.concatStringsSep "\n"
       (lib.filter (l: !lib.hasPrefix "#" l)
@@ -258,55 +343,55 @@ orc.mergeHomeFiles files [
 
 ### `Conflicting managed target files`
 
-See the dedicated section in README.md. Short answer: use `force = true` in
-`xdg.configFile` or `home.file`, or use `listFilesRecursiveFiltered` to avoid
-discovering duplicate symlinks.
+See README.md. Short answer: use `force = true` in `xdg.configFile` or
+`home.file`, or use `listFilesRecursiveFiltered` to avoid duplicate symlinks.
 
 ### Activation script does nothing in dry-run mode
 
-This is expected. home-manager's `run` helper silently prints commands when
-`DRY_RUN` is set. To preview: `home-manager switch --dry-run`.
+Expected. home-manager's `run` helper silently prints commands when `DRY_RUN`
+is set. Preview: `home-manager switch --dry-run`.
 
 ### `pkgs required for emitter="derivation"`
 
-Pass `pkgs` to `readConfigDir` or `emit`:
-
 ```nix
-orc.readConfigDir { inherit src pkgs; ... }
+orc.readConfigDir { inherit src pkgs; … }
 ```
 
 ### `emitter="text" requires a transform that sets entry.text`
 
-The `"text"` emitter requires `entry.text` to be set. Add a `transform`:
-
 ```nix
 transform = _: e: e // { text = builtins.readFile e.absPath; };
-```
-
-Or with a header:
-
-```nix
+# Or with a header:
 transform = _: e: e // { text = "# managed\n" + builtins.readFile e.absPath; };
 ```
 
-### `«error: attribute 'emitter' missing»`
+### `error: attribute 'emitter' missing`
 
-You are passing a raw `FileMap` (output of `listFilesRecursive` or
-`readDirFlat`) directly to `emit` or `toHomeFiles`. These functions require a
-`TaggedMap`. Fix by tagging the files first:
+You passed a raw `FileMap` to `emit` or `toHomeFiles`. Fix:
 
 ```nix
-# Option A: use tagAll when you have no filtering requirements
+# Option A: tagAll (no filtering)
 let tagged = orc.tagAll files;
-    result = orc.emit { files = tagged; ... };
+    result = orc.emit { files = tagged; … };
 
-# Option B: use applyPolicies when you want to filter/tag by rules
+# Option B: applyPolicies (with filtering)
 let tagged = orc.applyPolicies [ { emitter = "homeFiles"; } ] files;
-    result = orc.emit { files = tagged; ... };
+    result = orc.emit { files = tagged; … };
 
-# Option C: use readConfigDir which handles this for you
-let result = orc.readConfigDir { inherit src; ... };
+# Option C: readConfigDir (handles this automatically)
+let result = orc.readConfigDir { inherit src; … };
 ```
 
-Note: `readConfigDir` with `policies = []` automatically calls `tagAll`,
-so this error should not occur when using the high-level API.
+### `Unknown emitter tag "…"`
+
+You used an emitter name that isn't in the registry. Either:
+
+- Use a built-in name: `"homeFiles"`, `"derivation"`, `"symlinkTree"`
+- Register it with `registerEmitter` before calling `emit`
+
+### Priority not affecting merge result
+
+Ensure you're using `lib.mkMerge` in your home-manager module. The
+`lib.mkOrder` wrapping from `priority != 5` only takes effect when
+home-manager processes the attrset through `lib.mkMerge`. Direct attrset
+merges (`//`) always let the right side win regardless of priority.

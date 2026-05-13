@@ -4,42 +4,78 @@
 
 ```
 Path       :: Nix path (e.g. ./config or inputs.hypr-config)
+
 FileMap    :: { "rel/path" = { absPath :: string; type :: string; }; }
-TaggedMap  :: { "rel/path" = { absPath; type; emitter; priority; ?text; }; }
-HomeFiles  :: { "dest/key" = { source :: string; } | { text :: string; }; }
+
+TaggedMap  :: { "rel/path" = { absPath :: string
+                               type    :: string
+                               emitter  :: string
+                               priority :: int
+                               ?text   :: string
+                               ?force  :: bool
+                             };
+              }
+
+HomeFiles  :: { "dest/key" = { source :: string; } | { text :: string; }
+                              [// { force :: bool; }]
+                              [wrapped in lib.mkOrder]
+              }
+
 Activation :: string   (shell script for home.activation)
 
-EmitResult :: {
-  homeFiles    :: HomeFiles
-  derivation   :: StorePath   (present only if "derivation" emitter used)
-  symlinkTree  :: StorePath   (present only if "symlinkTree" emitter used)
-}
+EmitResult :: { homeFiles    :: HomeFiles
+                ?derivation  :: StorePath
+                ?symlinkTree :: StorePath
+                ?<custom>    :: any         (from registerEmitter)
+              }
 
-MergeResult :: {
-  homeFiles  :: HomeFiles
-  activation :: Activation
-}
+MergeResult :: { homeFiles  :: HomeFiles
+                 activation :: Activation
+               }
 
-Policy :: {
-  include   ? :: [ Pattern ]
-  exclude   ? :: [ Pattern ]
-  transform ? :: string → Entry → (Entry | null)
-  emitter   ? :: string
-  priority  ? :: int
-}
+Policy :: { include   ? :: [ Pattern ]
+            exclude   ? :: [ Pattern ]
+            transform ? :: string → Entry → (Entry | null)
+            emitter   ? :: string
+            priority  ? :: int
+          }
 
 HomePolicy :: Policy // {
-  destPrefix ? :: string
-  # emitter values: "symlink" | "copy" | "text"
-}
+               destPrefix ? :: string
+               force      ? :: bool
+               # emitter values: "symlink" | "copy" | "text"
+             }
 
-Pattern :: string   (see pattern syntax in README)
+Pattern :: string   (see pattern syntax below)
+
+EmitterBuilder :: { files      :: TaggedMap
+                    destPrefix :: string
+                    pkgs       :: Pkgs?
+                    drvName    :: string
+                  } → any
+
+EmitterRegistry :: { string = EmitterBuilder; }
 ```
 
-### TaggedMap invariant
+---
+
+## Pattern syntax
+
+| Pattern           | Semantics                                          |
+| ----------------- | -------------------------------------------------- |
+| `[]` or `[ "*" ]` | Accept everything (universal wildcard)             |
+| `"*"`             | Universal wildcard (any single string)             |
+| `"sys/"`          | Prefix match                                       |
+| `"*.conf"`        | Suffix match (leading `*` stripped)                |
+| `"sys/*"`         | Prefix match (trailing `*` stripped)               |
+| `"/ERE/"`         | POSIX extended regular expression (builtins.match) |
+
+---
+
+## TaggedMap invariant
 
 `emit` and `toHomeFiles` require a **TaggedMap** — every entry must carry
-`emitter` and `priority`. Callers must ensure this by using one of:
+`emitter` and `priority`. Use one of:
 
 | Function        | When to use                                           |
 | --------------- | ----------------------------------------------------- |
@@ -62,8 +98,6 @@ readDirFlat :: Path → { string = string; }
 Non-recursive directory listing. Returns `{ name → type }` where type is
 one of `"regular"`, `"directory"`, `"symlink"`, `"unknown"`.
 
-This is a thin wrapper around `builtins.readDir`.
-
 ---
 
 ### `listFilesRecursive`
@@ -72,10 +106,8 @@ This is a thin wrapper around `builtins.readDir`.
 listFilesRecursive :: Path → string → FileMap
 ```
 
-Recursively walks `dir`, collecting every non-directory entry
-(regular, symlink, unknown). Call with `prefix = ""` at the call-site.
-
-Returns: `{ "rel/path" = { absPath; type; }; }`
+Recursively walks `dir`, collecting every non-directory entry. Call with
+`prefix = ""` at the call-site.
 
 ---
 
@@ -86,14 +118,27 @@ listFilesRecursiveFiltered :: Path → string → [ string ] → FileMap
 ```
 
 Like `listFilesRecursive` but skips entries whose `type` is in `skipTypes`
-at discovery time. The skip propagates through all recursive calls.
-
-Use `skipTypes = [ "symlink" ]` to prevent aliased source-tree symlinks
-from generating duplicate `home.file` entries.
+at discovery time. Use `skipTypes = [ "symlink" ]` to prevent duplicate entries.
 
 ---
 
 ## Layer 2 · Policy Engine
+
+### `defaultPolicy`
+
+```
+defaultPolicy :: Policy
+```
+
+The built-in policy defaults:
+
+- `include = []` — accept everything
+- `exclude = []` — drop nothing
+- `transform = identity`
+- `emitter = "homeFiles"`
+- `priority = 5`
+
+---
 
 ### `matchesPattern`
 
@@ -101,7 +146,7 @@ from generating duplicate `home.file` entries.
 matchesPattern :: string → Pattern → bool
 ```
 
-Tests whether `relPath` matches `pattern`. See pattern syntax in README.
+Tests whether `relPath` matches `pattern`. See pattern syntax above.
 
 ---
 
@@ -124,14 +169,6 @@ applyPolicy :: Policy → FileMap → TaggedMap
 Applies a single policy to a file map. Surviving entries are tagged with
 `{ emitter; priority }`. The `transform` function may also add `{ text }`.
 
-Policy defaults:
-
-- `include = []` — accept everything
-- `exclude = []` — drop nothing
-- `transform = identity` — no modification
-- `emitter = "homeFiles"`
-- `priority = 5`
-
 ---
 
 ### `applyPolicies`
@@ -141,7 +178,6 @@ applyPolicies :: [ Policy ] → FileMap → TaggedMap
 ```
 
 Applies a list of policies in order. **Last match wins per file.**
-
 Files not matched by any policy are excluded from the result.
 
 ---
@@ -152,21 +188,18 @@ Files not matched by any policy are excluded from the result.
 tagAll :: FileMap → TaggedMap
 ```
 
-Stamps every entry in a raw `FileMap` with the default emitter
-(`"homeFiles"`) and priority (5). No filtering is applied — all entries
-survive.
+Stamps every entry with `emitter = "homeFiles"` and `priority = 5`.
+No filtering — all entries survive.
 
-Use this when you want every discovered file to become a `home.file`
-entry without any include/exclude logic. Semantically equivalent to:
+Semantically equivalent to:
 
 ```nix
 applyPolicies [ { include = []; emitter = "homeFiles"; priority = 5; } ] files
 ```
 
-but avoids the pattern-matching overhead.
+but avoids pattern-matching overhead.
 
-`readConfigDir` calls `tagAll` internally when `policies = []`, ensuring
-that `emit` always receives a valid `TaggedMap`.
+`readConfigDir` calls `tagAll` internally when `policies = []`.
 
 ---
 
@@ -179,16 +212,14 @@ toHomeFiles :: string → TaggedMap → HomeFiles
 ```
 
 Converts a tagged file map into a `home.file`-compatible attrset.
-`destPrefix` is prepended to every destination key (use `""` for none).
+`destPrefix` is prepended to every destination key.
 
 Entry mapping:
 
 - `entry.text` present → `{ text = entry.text; }`
-- `entry.force = true` present → value `// { force = true; }`
+- `entry.force = true` → value `// { force = true; }`
+- `entry.priority != 5` → value wrapped in `lib.mkOrder entry.priority`
 - otherwise → `{ source = entry.absPath; }`
-
-**Note:** home-manager installs all `home.file` entries as symlinks.
-See architecture.md for the symlink constraint.
 
 ---
 
@@ -198,10 +229,8 @@ See architecture.md for the symlink constraint.
 toDerivation :: { pkgs :: Pkgs; name ? :: string; files :: TaggedMap } → StorePath
 ```
 
-Builds a Nix store path that physically copies all files.
-Inline text entries (`entry.text`) are materialised via `builtins.toFile`.
-
-Default `name`: `"config-tree"`.
+Builds a Nix store path that physically copies all files. Default `name`:
+`"config-tree"`.
 
 ---
 
@@ -212,31 +241,57 @@ toSymlinkTree :: { pkgs :: Pkgs; name ? :: string; files :: TaggedMap } → Stor
 ```
 
 Builds a Nix store path whose contents are symlinks to source paths.
-Text entries are materialised via `builtins.toFile` before symlinking.
-
 Default `name`: `"config-symlinks"`.
+
+---
+
+### `registerEmitter`
+
+```
+registerEmitter :: EmitterRegistry → string → EmitterBuilder → EmitterRegistry
+```
+
+Returns a new emitter registry with `name → builder` added. Use to extend
+`emit` without modifying the library source (open/closed principle).
+
+```nix
+let
+  myEmitters = orc.registerEmitter orc.defaultEmitters "myType"
+    ({ files, destPrefix, pkgs, drvName }:
+      myCustomBuilder files);
+  result = orc.emit { inherit files pkgs; emitters = myEmitters; };
+in …
+```
+
+---
+
+### `defaultEmitters`
+
+```
+defaultEmitters :: EmitterRegistry
+```
+
+The built-in emitter registry. Pass to `registerEmitter` as the base when
+adding custom emitters.
 
 ---
 
 ### `emit`
 
 ```
-emit :: {
-  files       :: TaggedMap
-  destPrefix  ? :: string      (default: "")
-  pkgs        ? :: Pkgs        (required for "derivation" or "symlinkTree")
-  drvName     ? :: string      (default: "config-tree")
-} → EmitResult
+emit :: { files       :: TaggedMap
+          destPrefix  ? :: string       (default: "")
+          pkgs        ? :: Pkgs         (required for "derivation" or "symlinkTree")
+          drvName     ? :: string       (default: "config-tree")
+          emitters    ? :: EmitterRegistry   (default: builtinEmitters)
+        } → EmitResult
 ```
 
-Multi-emitter dispatch. Splits `files` by each entry's `emitter` tag and
-calls the appropriate low-level builder.
+Multi-emitter dispatch. Splits `files` by `emitter` tag and calls the
+registered builder.
 
 **Precondition:** every entry in `files` must have `emitter` and `priority`.
 Use `tagAll`, `applyPolicy`, or `applyPolicies` before calling `emit` directly.
-
-`pkgs` is required (and asserted) when any entry uses `"derivation"` or
-`"symlinkTree"`. `destPrefix` applies only to `homeFiles` keys.
 
 ---
 
@@ -246,11 +301,7 @@ Use `tagAll`, `applyPolicy`, or `applyPolicies` before calling `emit` directly.
 mergeHomeFiles :: FileMap → [ HomePolicy ] → MergeResult
 ```
 
-Home-manager-native combinator. Processes `files` through `policies` and
-returns two channels:
-
-- `homeFiles` — assign to `home.file = result.homeFiles`
-- `activation` — assign to `home.activation.<n> = lib.hm.dag.entryAfter ["writeBoundary"] result.activation`
+Home-manager-native combinator.
 
 **HomePolicy fields** (all optional):
 
@@ -259,30 +310,29 @@ returns two channels:
 | `include`    | `[ Pattern ]` | `[]`        | Accept everything if empty          |
 | `exclude`    | `[ Pattern ]` | `[]`        | Drop nothing if empty               |
 | `transform`  | function      | identity    | Modify entry or return null to drop |
-| `emitter`    | string        | `"symlink"` | See emitter table below             |
+| `emitter`    | string        | `"symlink"` | See table below                     |
 | `destPrefix` | string        | `""`        | Prepended to destination key        |
 | `priority`   | int           | `5`         | home-manager mkMerge priority       |
+| `force`      | bool          | `false`     | Set force=true on homeFiles entries |
 
 **Emitter destinations:**
 
-| `emitter`   | Output channel | Effect                                        |
-| ----------- | -------------- | --------------------------------------------- |
-| `"symlink"` | `homeFiles`    | `{ source = absPath; }` — read-only symlink   |
-| `"copy"`    | `activation`   | `run cp --remove-destination` — writable file |
-| `"text"`    | `homeFiles`    | `{ text = entry.text; }` — requires transform |
+| `emitter`   | Output channel | Effect                                                         |
+| ----------- | -------------- | -------------------------------------------------------------- |
+| `"symlink"` | `homeFiles`    | `{ source = absPath; ?force; ?mkOrder }` — read-only symlink   |
+| `"copy"`    | `activation`   | `run cp --remove-destination` — writable file                  |
+| `"text"`    | `homeFiles`    | `{ text = entry.text; ?force; ?mkOrder }` — requires transform |
 
 **Eviction rule:** a `"copy"` policy evicts the same destination key from
 `homeFiles`, even if a prior `"symlink"` policy placed it there.
 
-**Activation script format:** each `"copy"` entry generates:
+**Activation script format:**
 
 ```sh
 run mkdir -p "$(dirname "$HOME/<key>")"
 run cp --remove-destination /nix/store/... "$HOME/<key>"
 run chmod u+w "$HOME/<key>"
 ```
-
-The `run` helper is provided by home-manager and respects `DRY_RUN`.
 
 ---
 
@@ -291,14 +341,14 @@ The `run` helper is provided by home-manager and respects `DRY_RUN`.
 ### `readConfigDir`
 
 ```
-readConfigDir :: {
-  src        :: Path
-  recursive  ? :: bool      (default: true)
-  policies   ? :: [ Policy ] (default: [])
-  destPrefix ? :: string    (default: "")
-  pkgs       ? :: Pkgs      (required for "derivation" or "symlinkTree")
-  name       ? :: string    (default: "config-tree")
-} → EmitResult
+readConfigDir :: { src        :: Path
+                   recursive  ? :: bool           (default: true)
+                   policies   ? :: [ Policy ]     (default: [])
+                   destPrefix ? :: string         (default: "")
+                   pkgs       ? :: Pkgs           (required for "derivation" or "symlinkTree")
+                   name       ? :: string         (default: "config-tree")
+                   emitters   ? :: EmitterRegistry (default: builtinEmitters)
+                 } → EmitResult
 ```
 
 Discovers files under `src`, applies `policies`, dispatches emitters.
@@ -311,4 +361,27 @@ policies != []  →  Discovery → applyPolicies     → emit
 ```
 
 When `policies = []`, all discovered files pass through as `"homeFiles"`.
-`tagAll` ensures every entry is a valid `TaggedMap` entry before `emit`.
+
+---
+
+## Low-level exports (complete)
+
+```
+readDirFlat                  :: path → { name = type; }
+listFilesRecursive           :: path → string → FileMap
+listFilesRecursiveFiltered   :: path → string → [ type ] → FileMap
+matchesPattern               :: relPath → pattern → bool
+matchesAny                   :: relPath → [ pattern ] → bool
+defaultPolicy                :: Policy
+applyPolicy                  :: policy → files → TaggedMap
+applyPolicies                :: [ policy ] → files → TaggedMap
+tagAll                       :: FileMap → TaggedMap
+toHomeFiles                  :: destPrefix → TaggedMap → HomeFiles
+toDerivation                 :: { pkgs; name; files } → derivation
+toSymlinkTree                :: { pkgs; name; files } → derivation
+defaultEmitters              :: EmitterRegistry
+registerEmitter              :: EmitterRegistry → string → builder → EmitterRegistry
+emit                         :: { files; destPrefix; pkgs; drvName; emitters } → EmitResult
+mergeHomeFiles               :: FileMap → [ homePolicy ] → MergeResult
+readConfigDir                :: { src; recursive; policies; destPrefix; pkgs; name; emitters } → EmitResult
+```

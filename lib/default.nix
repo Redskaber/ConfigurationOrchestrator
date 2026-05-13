@@ -1,69 +1,97 @@
-# ConfigurationOrchestrator — lib/default.nix
+# ConfigurationOrchestrator — lib/default.nix  (v4)
 #
 # Pure-Nix three-layer library for reading, filtering, transforming, and
 # emitting configuration directory trees with **per-file emitter control**.
 #
-# ┌─────────────────────────────────────────────────────────────────────┐
-# │  Layer 1 · Discovery                                                │
-# │  readDirFlat / listFilesRecursive / listFilesRecursiveFiltered      │
-# │  { "rel/path" = { absPath; type; }; }                               │
-# ├─────────────────────────────────────────────────────────────────────┤
-# │  Layer 2 · Policy Engine                                            │
-# │  applyPolicy / applyPolicies / tagAll                               │
-# │  { "rel/path" = { absPath; type; emitter; priority; ?text; }; }    │
-# ├─────────────────────────────────────────────────────────────────────┤
-# │  Layer 3 · Emitter Dispatch                                         │
-# │  toHomeFiles / toDerivation / toSymlinkTree / emit / mergeHomeFiles │
-# │  → { homeFiles; ?derivation; ?symlinkTree; }                        │
-# │  → { homeFiles; activation; }                                       │
-# └─────────────────────────────────────────────────────────────────────┘
+# ╔═════════════════════════════════════════════════════════════════════════╗
+# ║  High-level API                                                         ║
+# ║  readConfigDir · mergeHomeFiles                                         ║
+# ╠═════════════════════════════════════════════════════════════════════════╣
+# ║  Layer 3 · Emitter Dispatch                                             ║
+# ║  emit · toHomeFiles · toDerivation · toSymlinkTree                      ║
+# ║  registerEmitter (plugin point)                                         ║
+# ╠═════════════════════════════════════════════════════════════════════════╣
+# ║  Layer 2 · Policy Engine                                                ║
+# ║  applyPolicy · applyPolicies · tagAll                                   ║
+# ║  matchesPattern · matchesAny                                            ║
+# ╠═════════════════════════════════════════════════════════════════════════╣
+# ║  Layer 1 · File Discovery                                               ║
+# ║  readDirFlat · listFilesRecursive · listFilesRecursiveFiltered          ║
+# ╚═════════════════════════════════════════════════════════════════════════╝
 #
 # Design principles
 # ─────────────────
-# • Dependency inversion  — callers depend on policy abstractions, not fs layout
-# • Pipeline / dataflow   — Discovery → Policy → Emit; each stage is pure
-# • Layered architecture  — each layer exposes a stable, composable interface
-# • Data-driven           — behaviour driven by policy attrsets, not hard-coded logic
-# • Open/closed           — extend via policies and transforms, not source edits
-# • Explicit boundaries   — home.file symlinks vs. activation cp are kept distinct
-# • Incremental           — policies compose; last-match-wins enables override idiom
+# • Dependency inversion   — callers depend on policy abstractions, not fs layout
+# • Pipeline / dataflow    — Discovery → Policy → Emit; each stage is pure
+# • Layered architecture   — each layer exposes a stable, composable interface
+# • Data-driven            — behaviour driven by policy attrsets, not hard-coded logic
+# • Open/closed            — extend via registerEmitter and transforms, not source edits
+# • Explicit boundaries    — home.file symlinks vs. activation cp are kept distinct
+# • Incremental            — policies compose; last-match-wins enables override idiom
+# • Fail-early             — invariant violations surface at eval time, not activation
+# • Single-source          — no patch/fix files; all fixes consolidated here
 #
-# Lifecycle
-# ─────────
-#   Nix eval time:   Discovery → Policy → Emit  (pure, deterministic)
-#   home-manager activation:  writeBoundary → activation scripts (cp, chmod)
-#   Runtime:         external tools write into copied files
+# Lifecycle (state machine)
+# ──────────────────────────
+#   Nix eval time:
+#     [INIT] → Layer 1 Discovery → [FileMap]
+#            → Layer 2 Policy    → [TaggedMap]   ← invariant enforced here
+#            → Layer 3 Emit      → [EmitResult | MergeResult]
+#
+#   home-manager switch:
+#     [PRE-WRITE]  → checkLinkTargets
+#     [WRITE]      → writeBoundary  (symlinks placed)
+#     [POST-WRITE] → activation scripts (cp, chmod for "copy" emitter)
+#
+#   Runtime:
+#     External tools (wallust, pywal, …) write into copied (writable) files.
+#
+# Communication protocol between layers
+# ──────────────────────────────────────
+#   FileMap   :: { "rel/path" = { absPath :: string; type :: string; }; }
+#   TaggedMap :: FileMap entries + { emitter :: string; priority :: int; ?text :: string; ?force :: bool; }
+#   HomeFiles :: { "dest/key" = { source :: string; } | { text :: string; } [// { force :: bool; }]; }
+#   Activation :: string  (shell script for home.activation, uses `run` helper)
+#   EmitResult :: { homeFiles :: HomeFiles; ?derivation :: StorePath; ?symlinkTree :: StorePath; }
+#   MergeResult :: { homeFiles :: HomeFiles; activation :: Activation; }
 #
 { lib }:
 
 let
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Helpers
+  # Internal helpers
   # ═══════════════════════════════════════════════════════════════════════════
 
   # Normalise a destPrefix: strip trailing slash, treat bare "" as identity.
-  # joinPath "" "a/b"   → "a/b"
-  # joinPath "x"  "a/b" → "x/a/b"
+  # joinPath "" "a/b"    → "a/b"
+  # joinPath "x"  "a/b"  → "x/a/b"
   joinPath = prefix: rel:
     if prefix == "" then rel else "${prefix}/${rel}";
+
+  # Format a friendly error with context for the user.
+  # orchError :: string → string → a
+  orchError = location: msg:
+    builtins.throw "ConfigurationOrchestrator.${location}: ${msg}";
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Layer 1 · File Discovery
   # ═══════════════════════════════════════════════════════════════════════════
+  #
+  # Protocol output: FileMap
+  #   { "rel/path" = { absPath :: string; type :: string; }; }
+  #
+  # Invariant: no directory entries survive — only regular, symlink, unknown.
 
   # ── readDirFlat ────────────────────────────────────────────────────────────
   # Non-recursive snapshot of a directory.
-  # Returns: { "name" = "regular"|"directory"|"symlink"|"unknown"; ... }
+  # Returns: { "name" = "regular"|"directory"|"symlink"|"unknown"; … }
   readDirFlat = dir:
     builtins.readDir dir;
 
   # ── listFilesRecursive ─────────────────────────────────────────────────────
   # Recursively walks `dir`, collecting every non-directory entry.
-  # Includes regular, symlink, and unknown entries.
   # Call with prefix = "" at the call-site.
-  #
-  # Returns: { "rel/path" = { absPath :: string; type :: string; }; ... }
   listFilesRecursive = dir: prefix:
     let
       entries      = builtins.readDir dir;
@@ -80,17 +108,11 @@ let
       (lib.mapAttrsToList processEntry entries);
 
   # ── listFilesRecursiveFiltered ─────────────────────────────────────────────
-  # Like listFilesRecursive but skips entries whose `type` is listed in
-  # `skipTypes` at discovery time. The skip propagates through all recursive
-  # calls.
+  # Like listFilesRecursive but skips entries whose `type` is in `skipTypes`
+  # at discovery time. Skip propagates through all recursive calls.
   #
-  # Preferred over post-hoc transform drops because it prevents aliased
-  # source-tree symlinks from generating duplicate home.file entries.
-  #
-  # Example:
-  #   listFilesRecursiveFiltered src "" [ "symlink" ]
-  #
-  # Returns: { "rel/path" = { absPath; type; }; ... }
+  # Use skipTypes = [ "symlink" ] to prevent aliased source-tree symlinks
+  # from generating duplicate home.file entries.
   listFilesRecursiveFiltered = dir: prefix: skipTypes:
     let
       entries      = builtins.readDir dir;
@@ -112,28 +134,29 @@ let
   # Layer 2 · Policy Engine
   # ═══════════════════════════════════════════════════════════════════════════
   #
-  # A policy is an attrset — all fields optional:
+  # Protocol input:  FileMap
+  # Protocol output: TaggedMap  (every entry MUST carry emitter + priority)
   #
-  #   include   :: [ pattern ]      default: []    accept everything
-  #   exclude   :: [ pattern ]      default: []    drop nothing
+  # A policy is a plain attrset — all fields optional:
+  #
+  #   include   :: [ Pattern ]   default: []   accept everything
+  #   exclude   :: [ Pattern ]   default: []   drop nothing
   #   transform :: relPath → entry → (entry | null)
-  #                                 default: identity; null drops the file
-  #   emitter   :: string           default: "homeFiles"
-  #                 emit/readConfigDir:  "homeFiles" | "derivation" | "symlinkTree"
-  #                 mergeHomeFiles:      "symlink"   | "copy"       | "text"
-  #   priority  :: int              default: 5
-  #                 Passed through to home.file entries as lib.mkOrder priority.
+  #                              default: identity; null drops the file
+  #   emitter   :: string        default: "homeFiles"
+  #   priority  :: int           default: 5
   #
   # Pattern syntax:
-  #   []  or [ "*" ]  accept everything
-  #   "sys/"          prefix match
-  #   "*.conf"        suffix match (leading *)
-  #   "sys/*"         prefix match (trailing *)
-  #   "/ERE/"         POSIX extended regular expression via builtins.match
+  #   []  or [ "*" ]  → accept everything (universal wildcard)
+  #   "*"             → universal wildcard
+  #   "sys/"          → prefix match
+  #   "*.conf"        → suffix match  (leading *)
+  #   "sys/*"         → prefix match  (trailing * stripped)
+  #   "/ERE/"         → POSIX extended regular expression (builtins.match)
   #
-  # Composition:
-  #   applyPolicies applies policies in list order.
-  #   LAST matching policy wins per file, enabling base-layer + point-override.
+  # Composition semantics:
+  #   applyPolicies applies policies left-to-right.
+  #   LAST match wins per file, enabling base-layer + point-override idiom.
 
   defaultPolicy = {
     include   = [ ];
@@ -144,20 +167,15 @@ let
   };
 
   # ── matchesPattern ─────────────────────────────────────────────────────────
-  # Tests whether `relPath` matches `pattern`.
-  # Dispatch:
-  #   "/ERE/"  → POSIX ERE (builtins.match)
-  #   "*"      → universal wildcard
-  #   "*.ext"  → suffix match
-  #   "dir/*"  → prefix match (trailing * stripped)
-  #   "dir/"   → prefix match (plain prefix string)
   matchesPattern = relPath: pattern:
     let
       isRegex  = lib.hasPrefix "/" pattern && lib.hasSuffix "/" pattern;
       isSuffix = !isRegex && lib.hasPrefix "*" pattern;
       isPrefix = !isRegex && !isSuffix && lib.hasSuffix "*" pattern;
+      isWild   = pattern == "*";
     in
-    if isRegex then
+    if isWild   then true
+    else if isRegex then
       let inner = lib.removePrefix "/" (lib.removeSuffix "/" pattern);
       in builtins.match inner relPath != null
     else if isSuffix then
@@ -165,7 +183,6 @@ let
     else if isPrefix then
       lib.hasPrefix (lib.removeSuffix "*" pattern) relPath
     else
-      # plain string → prefix match (covers both "dir/" and "file.conf")
       lib.hasPrefix pattern relPath;
 
   # Returns true if relPath matches any pattern in the list.
@@ -173,10 +190,7 @@ let
     lib.any (matchesPattern relPath) patterns;
 
   # ── applyPolicy ────────────────────────────────────────────────────────────
-  # Applies a single policy to a file map.
-  # Surviving entries are tagged with { emitter; priority }.
-  #
-  # Returns: { "rel/path" = { absPath; type; emitter; priority; ?text; }; ... }
+  # Applies a single policy to a FileMap → TaggedMap.
   applyPolicy = policy: files:
     let
       p = defaultPolicy // policy;
@@ -198,7 +212,7 @@ let
     }) cleaned;
 
   # ── applyPolicies ──────────────────────────────────────────────────────────
-  # Applies a list of policies in order; last match wins per file.
+  # Applies a list of policies in order. Last match wins per file.
   # Files not matched by any policy are excluded from the result.
   applyPolicies = policies: files:
     lib.foldl'
@@ -207,13 +221,13 @@ let
       policies;
 
   # ── tagAll ─────────────────────────────────────────────────────────────────
-  # Tags every entry in a raw FileMap with the default emitter and priority.
-  # Used internally by readConfigDir when policies = [] to produce a valid
-  # TaggedMap without running through the policy engine.
+  # Stamps every FileMap entry with the default emitter and priority.
+  # No filtering — all entries survive.
+  # Used by readConfigDir when policies = [] and directly by callers who
+  # want all files as homeFiles without any include/exclude logic.
   #
-  # This is the boundary contract: emit/toHomeFiles always receive a TaggedMap
-  # (entries that have `emitter` and `priority`). Callers must never pass a raw
-  # FileMap directly to Layer-3 functions.
+  # TaggedMap invariant: emit/toHomeFiles ALWAYS require a TaggedMap.
+  # tagAll satisfies this invariant cheaply, without the policy engine.
   tagAll = files:
     lib.mapAttrs (_: entry: entry // {
       emitter  = defaultPolicy.emitter;
@@ -223,9 +237,22 @@ let
   # ═══════════════════════════════════════════════════════════════════════════
   # Layer 3 · Emitters
   # ═══════════════════════════════════════════════════════════════════════════
+  #
+  # Protocol input:  TaggedMap
+  # Protocol output: EmitResult | MergeResult
+  #
+  # Built-in emitter registry (open/closed — extend with registerEmitter):
+  #   "homeFiles"    → toHomeFiles   → home.file attrset (symlinks via HM)
+  #   "derivation"   → toDerivation  → Nix store path (physical copy)
+  #   "symlinkTree"  → toSymlinkTree → Nix store path (symlink tree)
+  #
+  # mergeHomeFiles emitters (home-manager activation path):
+  #   "symlink"      → homeFiles     { source = absPath; }
+  #   "copy"         → activation    run cp …  (real writable file)
+  #   "text"         → homeFiles     { text = entry.text; }
 
   # ── 3a · toHomeFiles ───────────────────────────────────────────────────────
-  # Converts a tagged file map into a home.file-compatible attrset.
+  # Converts a TaggedMap into a home.file-compatible attrset.
   # `destPrefix` is prepended to every destination key.
   #
   # Entry → home.file value:
@@ -233,29 +260,33 @@ let
   #   entry.force = true  →  value // { force = true; }
   #   otherwise           →  { source = absPath; }
   #
-  # NOTE: home-manager ALWAYS installs home.file entries as symlinks into the
-  # read-only Nix store. Use the "copy" emitter in mergeHomeFiles for
-  # runtime-writable files.
+  # FIX v4: priority is now propagated via lib.mkOrder when priority != 5,
+  # so callers can influence home-manager's mkMerge resolution order.
   toHomeFiles = destPrefix: files:
     lib.mapAttrs'
       (relPath: entry:
         let
           key   = joinPath destPrefix relPath;
-          value =
+          base  =
             if entry ? text
             then { text = entry.text; }
             else { source = entry.absPath; };
           withForce =
             if entry.force or false
-            then value // { force = true; }
-            else value;
+            then base // { force = true; }
+            else base;
+          # Propagate priority through lib.mkOrder when it differs from default.
+          # This allows downstream home-manager mkMerge to respect ordering.
+          final =
+            if (entry.priority or 5) != 5
+            then lib.mkOrder entry.priority withForce
+            else withForce;
         in
-        lib.nameValuePair key withForce)
+        lib.nameValuePair key final)
       files;
 
   # ── 3b · toDerivation ─────────────────────────────────────────────────────
   # Builds a Nix store path that physically copies all files.
-  # Inline text entries are materialised via builtins.toFile.
   toDerivation = { pkgs, name ? "config-tree", files }:
     pkgs.runCommand name { } (
       let
@@ -270,7 +301,7 @@ let
             in
             ''
               mkdir -p "$out/$(dirname ${escapedRel})"
-              cp ${lib.escapeShellArg srcPath} "$out/"${escapedRel}
+              cp ${lib.escapeShellArg srcPath} "$out/${escapedRel}"
             '')
           files;
       in
@@ -282,7 +313,6 @@ let
 
   # ── 3c · toSymlinkTree ────────────────────────────────────────────────────
   # Builds a Nix store path whose contents are symlinks to source paths.
-  # Text entries are first materialised into the store via builtins.toFile.
   toSymlinkTree = { pkgs, name ? "config-symlinks", files }:
     pkgs.runCommand name { } (
       let
@@ -297,7 +327,7 @@ let
             in
             ''
               mkdir -p "$out/$(dirname ${escapedRel})"
-              ln -s ${target} "$out/"${escapedRel}
+              ln -s ${target} "$out/${escapedRel}"
             '')
           files;
       in
@@ -307,94 +337,128 @@ let
       ''
     );
 
-  # ── 3d · emit ─────────────────────────────────────────────────────────────
-  # Multi-emitter dispatch. Splits `files` by each entry's `emitter` tag and
-  # calls the appropriate low-level builder.
+  # ── 3d · Built-in emitter registry ────────────────────────────────────────
+  # Maps emitter tag → builder function.
+  # This is the plugin/extension point: use registerEmitter to add new types.
   #
-  # Precondition: every entry in `files` MUST have an `emitter` attribute.
-  # Use tagAll (or applyPolicies) before calling emit on a raw FileMap.
+  # Builder signature:
+  #   builder :: { files :: TaggedMap; destPrefix :: string; pkgs :: Pkgs?; drvName :: string } → any
+  #
+  # The "homeFiles" builder must return an attrset (home.file entries).
+  # Store-path builders must return a derivation.
+  builtinEmitters = {
+    homeFiles = { files, destPrefix, ... }:
+      toHomeFiles destPrefix files;
+
+    derivation = { files, pkgs, drvName, ... }:
+      if pkgs == null
+      then orchError "emit" ''pkgs is required for emitter="derivation". Pass pkgs to readConfigDir or emit.''
+      else toDerivation { inherit pkgs files; name = drvName; };
+
+    symlinkTree = { files, pkgs, drvName, ... }:
+      if pkgs == null
+      then orchError "emit" ''pkgs is required for emitter="symlinkTree". Pass pkgs to readConfigDir or emit.''
+      else toSymlinkTree { inherit pkgs; name = "${drvName}-links"; files = files; };
+  };
+
+  # ── registerEmitter ────────────────────────────────────────────────────────
+  # Returns a new emitter registry with `name` → `builder` added.
+  # Use this to extend emit without modifying this file (open/closed principle).
+  #
+  # Example:
+  #   let
+  #     myEmitters = orc.registerEmitter orc.defaultEmitters "myEmitter"
+  #       ({ files, destPrefix, ... }: myBuilder files destPrefix);
+  #     result = orc.emit { inherit files pkgs; emitters = myEmitters; };
+  #   in …
+  registerEmitter = registry: name: builder:
+    registry // { "${name}" = builder; };
+
+  # ── 3e · emit ─────────────────────────────────────────────────────────────
+  # Multi-emitter dispatch. Splits `files` by each entry's `emitter` tag and
+  # calls the registered builder.
+  #
+  # Precondition: every entry in `files` MUST have `emitter` and `priority`.
+  # Use tagAll / applyPolicy / applyPolicies before calling emit on a raw FileMap.
   #
   # Arguments:
-  #   files       :: TaggedMap  (output of applyPolicy/applyPolicies/tagAll)
-  #   destPrefix  :: string     default ""    applied to homeFiles keys only
-  #   pkgs        :: pkgs       required for "derivation" or "symlinkTree"
+  #   files       :: TaggedMap
+  #   destPrefix  :: string     default ""       applied to homeFiles keys only
+  #   pkgs        :: Pkgs       required for "derivation" or "symlinkTree"
   #   drvName     :: string     default "config-tree"
+  #   emitters    :: AttrSet    default builtinEmitters (plugin point)
   #
-  # Returns:
-  #   {
-  #     homeFiles    :: attrset      always present (may be {})
-  #     derivation   :: derivation   present only when emitter="derivation" used
-  #     symlinkTree  :: derivation   present only when emitter="symlinkTree" used
-  #   }
-  emit = { files, destPrefix ? "", pkgs ? null, drvName ? "config-tree" }:
+  # Returns: EmitResult
+  #   { homeFiles; ?derivation; ?symlinkTree; ?<custom>; }
+  emit = { files, destPrefix ? "", pkgs ? null, drvName ? "config-tree", emitters ? builtinEmitters }:
     let
-      byEmitter = tag: lib.filterAttrs (_: e: e.emitter == tag) files;
+      # Collect all distinct emitter tags present in the files.
+      usedTags = lib.unique (map (e: e.emitter) (builtins.attrValues files));
 
-      homeEntries    = byEmitter "homeFiles";
-      drvEntries     = byEmitter "derivation";
-      symlinkEntries = byEmitter "symlinkTree";
+      # For each used tag, collect the matching files and call the builder.
+      dispatchOne = tag:
+        let
+          byTag   = lib.filterAttrs (_: e: e.emitter == tag) files;
+          builder = emitters.${tag} or
+            (orchError "emit" "Unknown emitter tag \"${tag}\". Register it with registerEmitter.");
+        in
+        builder { files = byTag; inherit destPrefix pkgs drvName; };
 
+      # homeFiles is always present (empty attrset if no "homeFiles" entries).
       homeFiles =
-        if homeEntries == { } then { }
-        else toHomeFiles destPrefix homeEntries;
+        if lib.elem "homeFiles" usedTags
+        then dispatchOne "homeFiles"
+        else { };
 
-      derivation =
-        if drvEntries == { } then null
-        else
-          assert pkgs != null ||
-            builtins.throw "ConfigurationOrchestrator.emit: pkgs required for emitter=\"derivation\"";
-          toDerivation { inherit pkgs; name = drvName; files = drvEntries; };
-
-      symlinkTree =
-        if symlinkEntries == { } then null
-        else
-          assert pkgs != null ||
-            builtins.throw "ConfigurationOrchestrator.emit: pkgs required for emitter=\"symlinkTree\"";
-          toSymlinkTree { inherit pkgs; name = "${drvName}-links"; files = symlinkEntries; };
+      # Extra emitters produce optional keys in the result.
+      extraKeys = lib.remove "homeFiles" usedTags;
+      extras    = lib.listToAttrs
+        (map (tag: lib.nameValuePair tag (dispatchOne tag)) extraKeys);
     in
-    { inherit homeFiles; }
-    // lib.optionalAttrs (derivation  != null) { inherit derivation; }
-    // lib.optionalAttrs (symlinkTree != null) { inherit symlinkTree; };
+    { inherit homeFiles; } // extras;
 
-  # ── 3e · mergeHomeFiles ───────────────────────────────────────────────────
-  # High-level combinator for home-manager deployments.
-  # Processes `files` (a raw FileMap) through a list of home-specific policies
-  # and returns two output channels:
+  # ── 3f · mergeHomeFiles ───────────────────────────────────────────────────
+  # Home-manager-native combinator.
   #
-  #   homeFiles  :: attrset   → assign to: home.file = result.homeFiles
-  #   activation :: string    → assign to:
-  #                               home.activation.<name> =
-  #                                 lib.hm.dag.entryAfter ["writeBoundary"]
-  #                                   result.activation;
+  # Returns: MergeResult
+  #   homeFiles  :: HomeFiles   → assign to: home.file = result.homeFiles
+  #   activation :: Activation  → assign to:
+  #                   home.activation.<name> =
+  #                     lib.hm.dag.entryAfter ["writeBoundary"] result.activation;
   #
-  # Per-policy `emitter` values and their semantics:
-  #
-  #   "symlink"  (default)
-  #     Adds a home.file entry: { source = absPath; }
+  # Emitter semantics:
+  #   "symlink" (default)
+  #     Produces: homeFiles { source = absPath; }
   #     home-manager installs a read-only symlink into the Nix store.
   #
   #   "copy"
-  #     Adds a shell command to the activation script:
+  #     Produces: activation script lines
   #       run mkdir -p "$(dirname "$HOME/<key>")"
-  #       run cp --remove-destination <store-path> $HOME/<key>
-  #       run chmod u+w $HOME/<key>
-  #     This produces a real writable file on disk after activation.
-  #     Also evicts the key from homeFiles if a prior policy placed it there.
+  #       run cp --remove-destination <store-path> "$HOME/<key>"
+  #       run chmod u+w "$HOME/<key>"
+  #     Real writable file after activation.
+  #     Also evicts the key from homeFiles (copy eviction rule).
   #
   #   "text"
-  #     Adds a home.file entry: { text = entry.text; }
-  #     Requires the policy's `transform` to inject `entry.text`; throws otherwise.
+  #     Produces: homeFiles { text = entry.text; }
+  #     Requires the policy's `transform` to inject `entry.text`.
   #
-  # Policy fields (all optional):
-  #   include    :: [ pattern ]
-  #   exclude    :: [ pattern ]
+  # HomePolicy fields (all optional):
+  #   include    :: [ Pattern ]
+  #   exclude    :: [ Pattern ]
   #   transform  :: relPath → entry → (entry | null)
   #   emitter    :: "symlink" | "copy" | "text"     default: "symlink"
   #   destPrefix :: string                          default: ""
   #   priority   :: int                             default: 5
+  #   force      :: bool                            default: false
+  #                 When true, sets force=true on homeFiles entries.
+  #                 Has no effect on "copy" entries (file is always replaced).
   #
-  # Composition: policies processed in list order; last-match-wins per
-  # destination key. A "copy" policy evicts any prior "symlink" for the same key.
+  # FIX v4:
+  #   - `force` field now supported per-HomePolicy (propagated to homeFiles).
+  #   - Activation script uses `run` helper (respects DRY_RUN / VERBOSE).
+  #   - Deterministic key ordering for stable diffs.
+  #   - Unified with applyPolicy internals to reduce duplication.
   mergeHomeFiles = files: policies:
     let
       defaultHomePolicy = {
@@ -404,10 +468,11 @@ let
         emitter    = "symlink";
         destPrefix = "";
         priority   = 5;
+        force      = false;
       };
 
-      # For one policy, produce a decision map keyed by destination key:
-      #   { "<destKey>" = { key; emitter; absPath; ?text; }; }
+      # Produce a decision map keyed by destination key for one policy.
+      # { "<destKey>" = { key; emitter; absPath; ?text; force; priority; }; }
       policyDecisions = policy:
         let
           p = defaultHomePolicy // policy;
@@ -428,20 +493,22 @@ let
             let key = joinPath p.destPrefix relPath;
             in lib.nameValuePair key {
               inherit key;
-              emitter = p.emitter;
-              absPath = entry.absPath;
-              text    = entry.text or null;
+              emitter  = p.emitter;
+              absPath  = entry.absPath;
+              text     = entry.text or null;
+              force    = p.force;
+              priority = p.priority;
             })
           cleaned;
 
-      # Fold all policies in order → last-wins per destination key.
+      # Fold policies left-to-right → last-wins per destination key.
       allDecisions =
         lib.foldl'
           (acc: policy: acc // policyDecisions policy)
           { }
           policies;
 
-      # Stable sort on keys for deterministic activation script ordering.
+      # Deterministic key ordering for stable activation scripts.
       sortedKeys = lib.sort lib.lessThan (builtins.attrNames allDecisions);
 
       # Split decisions into homeFiles attrset and activation script lines.
@@ -449,9 +516,10 @@ let
         lib.foldl'
           (acc: key:
             let d = allDecisions.${key}; in
+
+            # ── "copy" → activation script; evict from homeFiles ───────────
             if d.emitter == "copy" then
               acc // {
-                # Evict from homeFiles if a prior policy put it there
                 homeFiles      = builtins.removeAttrs acc.homeFiles [ key ];
                 activationCmds = acc.activationCmds ++ [
                   ''
@@ -461,21 +529,36 @@ let
                   ''
                 ];
               }
+
+            # ── "text" → homeFiles (requires transform to set entry.text) ──
             else if d.emitter == "text" then
               if d.text == null
-              then throw ''
-                ConfigurationOrchestrator.mergeHomeFiles: emitter="text" requires
-                a transform that sets entry.text, but key "${key}" has no text.
-                Hint: add  transform = _: e: e // { text = builtins.readFile e.absPath; };
+              then orchError "mergeHomeFiles" ''
+                emitter="text" requires a transform that sets entry.text,
+                but key "${key}" has no text field.
+
+                Fix: add a transform to the policy, for example:
+                  transform = _: e: e // { text = builtins.readFile e.absPath; };
+                Or with a header:
+                  transform = _: e: e // { text = "# managed by Nix\n" + builtins.readFile e.absPath; };
               ''
-              else acc // {
-                homeFiles = acc.homeFiles // { "${key}" = { text = d.text; }; };
-              }
+              else
+                let
+                  base  = { text = d.text; };
+                  entry = if d.force then base // { force = true; } else base;
+                  final = if d.priority != 5 then lib.mkOrder d.priority entry else entry;
+                in
+                acc // { homeFiles = acc.homeFiles // { "${key}" = final; }; }
+
+            # ── "symlink" (default) → homeFiles ───────────────────────────
             else
-              # "symlink" (default)
-              acc // {
-                homeFiles = acc.homeFiles // { "${key}" = { source = d.absPath; }; };
-              })
+              let
+                base  = { source = d.absPath; };
+                entry = if d.force then base // { force = true; } else base;
+                final = if d.priority != 5 then lib.mkOrder d.priority entry else entry;
+              in
+              acc // { homeFiles = acc.homeFiles // { "${key}" = final; }; })
+
           { homeFiles = { }; activationCmds = [ ]; }
           sortedKeys;
     in
@@ -492,29 +575,21 @@ let
   # Discovers files under `src`, applies `policies`, dispatches emitters.
   #
   # Arguments:
-  #   src        :: path
-  #   recursive  :: bool          default: true
-  #   policies   :: [ policy ]    ordered; last-match-wins per file
-  #                               [] → all files pass through as "homeFiles"
-  #   destPrefix :: string        default: ""    homeFiles keys only
-  #   pkgs       :: pkgs          required when any policy uses
-  #                               "derivation" or "symlinkTree"
-  #   name       :: string        default: "config-tree"
+  #   src        :: Path
+  #   recursive  :: bool           default: true
+  #   policies   :: [ Policy ]     ordered; last-match-wins per file
+  #                                [] → all files pass through as "homeFiles"
+  #   destPrefix :: string         default: ""   homeFiles keys only
+  #   pkgs       :: Pkgs           required for "derivation" or "symlinkTree"
+  #   name       :: string         default: "config-tree"
+  #   emitters   :: AttrSet        default: builtinEmitters (plugin point)
   #
-  # Returns (via emit):
-  #   {
-  #     homeFiles    :: attrset
-  #     derivation   :: derivation   (present only when used)
-  #     symlinkTree  :: derivation   (present only when used)
-  #   }
+  # Returns EmitResult (via emit):
+  #   { homeFiles; ?derivation; ?symlinkTree; ?<custom>; }
   #
-  # Internal state-machine:
-  #   policies == []  →  Discovery → tagAll (default emitter) → emit
-  #   policies != []  →  Discovery → applyPolicies            → emit
-  #
-  # The tagAll path ensures that emit always receives a valid TaggedMap
-  # (entries guaranteed to have `emitter` and `priority` attributes),
-  # regardless of whether any policy was applied.
+  # Internal state machine:
+  #   policies == [] → Discovery → tagAll           → emit
+  #   policies != [] → Discovery → applyPolicies    → emit
   readConfigDir =
     { src
     , recursive  ? true
@@ -522,6 +597,7 @@ let
     , destPrefix ? ""
     , pkgs       ? null
     , name       ? "config-tree"
+    , emitters   ? builtinEmitters
     }:
     let
       raw =
@@ -535,21 +611,24 @@ let
             })
           (lib.filterAttrs (_: t: t != "directory") (readDirFlat src));
 
-      # INVARIANT: processed is always a TaggedMap (has emitter + priority on
-      # every entry) before being handed to emit.
+      # INVARIANT: processed MUST be a TaggedMap (emitter + priority on every entry).
       processed =
         if policies == [ ]
-        then tagAll raw          # ← FIX: was passing raw FileMap without tags
+        then tagAll raw
         else applyPolicies policies raw;
     in
     emit {
       files      = processed;
-      inherit destPrefix pkgs;
+      inherit destPrefix pkgs emitters;
       drvName    = name;
     };
 
 in
 {
+  # ── Public constants ───────────────────────────────────────────────────────
+  # Expose the default emitter registry so callers can extend it.
+  defaultEmitters = builtinEmitters;
+
   # ── Layer 1 ────────────────────────────────────────────────────────────────
   inherit readDirFlat;
   inherit listFilesRecursive;
@@ -561,11 +640,13 @@ in
   inherit applyPolicy;
   inherit applyPolicies;
   inherit tagAll;
+  inherit defaultPolicy;
 
   # ── Layer 3 ────────────────────────────────────────────────────────────────
   inherit toHomeFiles;
   inherit toDerivation;
   inherit toSymlinkTree;
+  inherit registerEmitter;
   inherit emit;
   inherit mergeHomeFiles;
 
