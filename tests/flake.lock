@@ -17,11 +17,11 @@
     "hypr-config": {
       "flake": false,
       "locked": {
-        "lastModified": 1776452579,
-        "narHash": "sha256-qittGeOmLImvsB6LMksJtqhoTdE8Fs944rmCZeZFgic=",
+        "lastModified": 1777565795,
+        "narHash": "sha256-fNxnup3uVfN+jei0/v7rvJftusZicvOvfm40jDuxqpE=",
         "owner": "redskaber",
         "repo": "hypr-config",
-        "rev": "ac8b4d8f3774b57d6002ebdd22fb846261c730bd",
+        "rev": "a4228c708888ec54b82ac730b98d118028255e7e",
         "type": "github"
       },
       "original": {
@@ -48,11 +48,11 @@
     },
     "nixpkgs_2": {
       "locked": {
-        "lastModified": 1776877367,
-        "narHash": "sha256-EHq1/OX139R1RvBzOJ0aMRT3xnWyqtHBRUBuO1gFzjI=",
+        "lastModified": 1778443072,
+        "narHash": "sha256-zi7/fsqM/kFdNuED//4WOCUtezGtKKqRNORjMvfwjnA=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "0726a0ecb6d4e08f6adced58726b95db924cef57",
+        "rev": "da5ad661ba4e5ef59ba743f0d112cbc30e474f32",
         "type": "github"
       },
       "original": {

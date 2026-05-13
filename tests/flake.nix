@@ -1,12 +1,18 @@
+# ConfigurationOrchestrator — tests/flake.nix
+#
+# Run the test suite:
+#   cd test
+#   nix eval .#_summary
+#   nix eval . --json | jq .layer3
+#
+# path:.. resolves to the parent directory (the library itself).
+# Local changes to lib/ take effect immediately without a GitHub push.
+# Run `nix flake update` only to pin a specific remote revision.
 {
   description = "ConfigurationOrchestrator — test suite";
 
   inputs = {
     nixpkgs.url                    = "github:NixOS/nixpkgs/nixos-unstable";
-    # path:.. resolves to the parent directory (the library itself).
-    # This means local changes to lib/ take effect immediately without
-    # needing a push to GitHub. Run `nix flake update` only when you
-    # want to pull a specific pinned remote revision.
     configuration-orchestrator.url = "path:..";
     hypr-config.url                = "github:redskaber/hypr-config";
     hypr-config.flake              = false;

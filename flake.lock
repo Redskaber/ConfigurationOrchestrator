@@ -1,21 +1,5 @@
 {
   "nodes": {
-    "hypr-config": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1776452579,
-        "narHash": "sha256-qittGeOmLImvsB6LMksJtqhoTdE8Fs944rmCZeZFgic=",
-        "owner": "redskaber",
-        "repo": "hypr-config",
-        "rev": "ac8b4d8f3774b57d6002ebdd22fb846261c730bd",
-        "type": "github"
-      },
-      "original": {
-        "owner": "redskaber",
-        "repo": "hypr-config",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1776877367,
@@ -34,7 +18,6 @@
     },
     "root": {
       "inputs": {
-        "hypr-config": "hypr-config",
         "nixpkgs": "nixpkgs"
       }
     }
