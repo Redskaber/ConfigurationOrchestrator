@@ -453,12 +453,38 @@ let
   #   force      :: bool                            default: false
   #                 When true, sets force=true on homeFiles entries.
   #                 Has no effect on "copy" entries (file is always replaced).
+  #   allowEmpty :: bool                            default: false
+  #                 The include-intent guard opt-out: when include names
+  #                 specific patterns yet selects NOTHING from the FileMap,
+  #                 the default is to fail at eval time (a policy that
+  #                 names files it cannot select is almost certainly rot:
+  #                 renamed key, missing tree entry, typo'd pattern). Set
+  #                 allowEmpty = true to assert in code that the empty
+  #                 result is intended (exploratory policies, cross-tree
+  #                 merges where the key may legitimately be absent).
   #
   # FIX v4:
   #   - `force` field now supported per-HomePolicy (propagated to homeFiles).
   #   - Activation script uses `run` helper (respects DRY_RUN / VERBOSE).
   #   - Deterministic key ordering for stable diffs.
   #   - Unified with applyPolicy internals to reduce duplication.
+  #
+  # FIX v5 (include-intent guard):
+  #   - A policy with a non-empty include that selects nothing now fails
+  #     at eval time instead of silently producing an empty activation.
+  #     Rationale: the "silent no-op" failure class — an activation that
+  #     claims to plant files but contains zero commands — is the worst
+  #     failure mode a config pipeline can have (no error, no effect; first
+  #     caught in the wild by nix-config's 99th test: a swaync theme chain
+  #     whose include matched no tree entry). Mirrors the emitter="text"
+  #     contract already enforced here: declared intent + missing input
+  #     → fail fast, at evaluation.
+  #   - allowEmpty = true is the explicit opt-out (see field docs above).
+  #   - Deliberately NOT added to applyPolicy (Layer 2): applyPolicy is a
+  #     composable intermediate where a zero-match is a legal stream state
+  #     (base layers filtered before narrower overlays fold on top);
+  #     mergeHomeFiles is the terminal combinator where include is an
+  #     intent declaration — the guard belongs to the intent layer.
   mergeHomeFiles = files: policies:
     let
       defaultHomePolicy = {
@@ -469,6 +495,7 @@ let
         destPrefix = "";
         priority   = 5;
         force      = false;
+        allowEmpty = false;
       };
 
       # Produce a decision map keyed by destination key for one policy.
@@ -487,6 +514,41 @@ let
           filtered    = lib.filterAttrs keep files;
           transformed = lib.mapAttrs (relPath: entry: p.transform relPath entry) filtered;
           cleaned     = lib.filterAttrs (_: v: v != null) transformed;
+
+          # ── v5 · include-intent guard ─────────────────────────
+          # A policy that names include patterns but selects nothing is
+          # treated as rot and fails at eval time. Pre-guard behaviour:
+          # empty activationCmds → activation = "" → a home.activation
+          # entry that runs zero commands — claimed plants, no effect,
+          # no error. The FileMap keys echoed below are relPaths (never
+          # store paths), so diagnostics stay regex-free and grep-able.
+          guarded =
+            if p.include != [ ] && cleaned == { } && !p.allowEmpty
+            then orchError "mergeHomeFiles" ''
+              include is non-empty but the FileMap matched nothing.
+
+              include patterns (${toString (builtins.length p.include)}):
+                ${lib.concatStringsSep "\n  " p.include}
+
+              FileMap keys (${toString (builtins.length (builtins.attrNames files))}):
+                ${lib.concatStringsSep "\n  "
+                  (lib.take 12 (lib.sort lib.lessThan (builtins.attrNames files)))}
+
+              A policy that names files it cannot select is almost certainly
+              rot (renamed key, missing tree entry, typo'd pattern). Fix (pick one):
+                1. correct the include pattern(s) — pattern syntax is
+                   prefix "dir/", suffix "*.ext", glob "dir/*", regex "/re/"
+                2. grow the source tree with the expected file
+                   (committed placeholder — the pattern sibling config
+                   trees use for wallust targets)
+                3. synthesize the FileMap entry at the call-site:
+                     { "<relpath>" = { absPath = …; type = "regular"; }; }
+                     // listFilesRecursive <tree> ""
+                   (merge order keeps the tree entry winning once it exists)
+                4. opt out explicitly with allowEmpty = true — asserts
+                   the empty result is intended
+            ''
+            else cleaned;
         in
         lib.mapAttrs'
           (relPath: entry:
@@ -499,7 +561,7 @@ let
               force    = p.force;
               priority = p.priority;
             })
-          cleaned;
+          guarded;
 
       # Fold policies left-to-right → last-wins per destination key.
       allDecisions =
@@ -562,7 +624,13 @@ let
           { homeFiles = { }; activationCmds = [ ]; }
           sortedKeys;
     in
-    {
+    # v5: force the decision map at return time. Without this the
+    # include-intent guard's throw sits in a thunk buried under
+    # homeFiles/activation — a shallow tryEval (and any consumer that
+    # never forces the result) would sail past it. deepSeq on allDecisions
+    # (plain values only: strings / ints / bools) is side-effect free and
+    # makes the guard fire the moment the merge result itself is forced.
+    builtins.deepSeq allDecisions {
       homeFiles  = finalResult.homeFiles;
       activation = lib.concatStringsSep "\n" finalResult.activationCmds;
     };

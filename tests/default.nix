@@ -339,6 +339,68 @@ let
       hasForce    = val != null && (val.force or false);
     };
 
+  # ── v5: include-intent guard — declared intent must select ──────────
+  # A policy that names include patterns but selects nothing from the
+  # FileMap must fail AT EVAL TIME (the "silent no-op" activation was the
+  # pre-v5 failure class, first caught in the wild by nix-config's 99th
+  # test: a swaync theme chain whose include matched no tree entry).
+  # Paths locked here: normal merge untouched, guard fires, escape hatch
+  # produces the (asserted-intended) empty result, include=[] keeps the
+  # accept-all semantics, and per-policy isolation (a rotting later policy
+  # is caught even when an earlier one matched fine).
+  t_mergeHomeFiles_includeGuard =
+    let
+      normal = orc.mergeHomeFiles allFiles [
+        { include    = [ "hyprland.conf" ];
+          emitter    = "symlink";
+          destPrefix = ".config/hypr"; }
+      ];
+      guarded = builtins.tryEval (orc.mergeHomeFiles allFiles [
+        { include    = [ "no/such/file.conf" ];
+          emitter    = "copy";
+          destPrefix = ".config/hypr"; }
+      ]);
+      escaped = orc.mergeHomeFiles allFiles [
+        { include    = [ "no/such/file.conf" ];
+          emitter    = "copy";
+          destPrefix = ".config/hypr";
+          allowEmpty = true; }
+      ];
+      acceptAll = orc.mergeHomeFiles allFiles [
+        { include    = [ ];
+          emitter    = "symlink";
+          destPrefix = ".config/hypr"; }
+      ];
+      laterRot = builtins.tryEval (orc.mergeHomeFiles allFiles [
+        { include    = [ "hyprland.conf" ];
+          emitter    = "symlink";
+          destPrefix = ".config/hypr"; }
+        { include    = [ "no/such/file.conf" ];
+          emitter    = "copy";
+          destPrefix = ".config/hypr"; }
+      ]);
+    in {
+      normalPathUntouched    = normal.homeFiles ? ".config/hypr/hyprland.conf";
+      guardFailsEval         = ! guarded.success;
+      guardPerPolicyIsolated = ! laterRot.success;
+      escapeHatchMerges      = escaped.homeFiles == { };
+      escapeHatchEmptyAct    = escaped.activation == "";
+      acceptAllStillWorks    = acceptAll.homeFiles != { };
+    };
+
+  # The guard throws eagerly at merge time — not lazily via an error value
+  # smuggled through the result attrset. deepSeq forces every leaf of the
+  # merge result; the throw must still be the outcome.
+  t_mergeHomeFiles_includeGuard_eager =
+    let
+      deep = builtins.tryEval
+        (builtins.deepSeq (orc.mergeHomeFiles allFiles [
+          { include = [ "ghost.conf" ]; emitter = "symlink"; }
+        ]) true);
+    in {
+      throwsDeeply = ! deep.success;
+    };
+
   # ═══════════════════════════════════════════════════════════════════════════
   # Layer 3d · emit (multi-emitter dispatch)
   # ═══════════════════════════════════════════════════════════════════════════
@@ -558,6 +620,8 @@ let
       mergeHomeFiles_copyEvictsSymlink = t_mergeHomeFiles_copyEvictsSymlink;
       mergeHomeFiles_force         = t_mergeHomeFiles_force;
       mergeHomeFiles_force_text    = t_mergeHomeFiles_force_text;
+      mergeHomeFiles_includeGuard       = t_mergeHomeFiles_includeGuard;
+      mergeHomeFiles_includeGuard_eager = t_mergeHomeFiles_includeGuard_eager;
       emit_homeOnly                = t_emit_homeOnly;
       emit_derivationOnly          = t_emit_derivationOnly;
       emit_symlinkOnly             = t_emit_symlinkOnly;
